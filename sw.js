@@ -1,5 +1,5 @@
-const CACHE = 'rail-station-v2';
-const FILES = ['./', './index.html', './stations.js', './manifest.webmanifest', './icon-180.png', './icon-512.png'];
+const CACHE = 'rail-station-v3';
+const FILES = ['./', './index.html', './stations.js', './tracks.js', './manifest.webmanifest', './icon-180.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES)).then(() => self.skipWaiting()));

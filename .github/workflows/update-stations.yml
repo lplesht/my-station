@@ -23,8 +23,9 @@ jobs:
           { echo '```'; cat report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Commit
         run: |
-          git diff --quiet stations.js && { echo "No changes"; exit 0; }
+          git add stations.js tracks.js
+          git diff --cached --quiet && { echo "No changes"; exit 0; }
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -am "Update stations.js from MOT GTFS"
+          git commit -m "Update stations and tracks from MOT GTFS"
           git push

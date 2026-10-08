@@ -39,9 +39,12 @@
   <div id="note">לחץ כדי לבדוק</div>
 </button>
 <script src="stations.js"></script>
+<script src="tracks.js"></script>
 <script>
 (function () {
-  var NEAR_M = 1000;          // עד המרחק הזה מציגים "תחנה X"; מעבר לו "בין X ל-Y"
+  var NEAR_M = 1000;          // עד המרחק הזה מציגים "תחנה X"
+  var ON_TRACK_M = 300;       // עד המרחק הזה מהמסילה נחשבים "בדרך, בין X ל-Y"
+  var LINE_M = 700;           // בלי נתוני מסילה: מרחק מותר מהקו הישר בין שתי תחנות
   var btn = document.getElementById('btn');
   var kicker = document.getElementById('kicker');
   var nameEl = document.getElementById('name');
@@ -55,17 +58,61 @@
     return 2 * R * Math.asin(Math.sqrt(a));
   }
 
-  // מחזיר את שתי התחנות הקרובות ביותר
-  function nearestTwo(lat, lon) {
-    var list = STATIONS.map(function (s) { return { n: s[0], d: dist(lat, lon, s[1], s[2]) }; });
+  // מרחק (מטרים) מנקודה לקטע, ומיקום ההטלה על הקטע (0 עד 1), בהטלה שטוחה מקומית
+  function toSeg(lat, lon, lat1, lon1, lat2, lon2) {
+    var kx = 111320 * Math.cos(lat * Math.PI / 180), ky = 110540;
+    var ax = (lon1 - lon) * kx, ay = (lat1 - lat) * ky;
+    var bx = (lon2 - lon) * kx, by = (lat2 - lat) * ky;
+    var dx = bx - ax, dy = by - ay, L2 = dx * dx + dy * dy;
+    var t = L2 ? -(ax * dx + ay * dy) / L2 : 0;
+    var tc = Math.max(0, Math.min(1, t));
+    return { d: Math.hypot(ax + dx * tc, ay + dy * tc), t: t };
+  }
+
+  function stationsByDistance(lat, lon) {
+    var list = STATIONS.map(function (s, i) { return { i: i, n: s[0], d: dist(lat, lon, s[1], s[2]) }; });
     list.sort(function (a, b) { return a.d - b.d; });
-    return [list[0], list[1]];
+    return list;
+  }
+
+  // על המסילה? מחזיר את שתי התחנות הסמוכות לאורך המסילה, או null
+  function betweenOnTrack(lat, lon) {
+    var best = null;
+    TRACKS.forEach(function (tr) {
+      var p = tr.p;
+      for (var k = 0; k + 3 < p.length; k += 2) {
+        var r = toSeg(lat, lon, p[k], p[k + 1], p[k + 2], p[k + 3]);
+        if (!best || r.d < best.d) best = { d: r.d, tr: tr, seg: k / 2 };
+      }
+    });
+    if (!best || best.d > ON_TRACK_M) return null;
+    var prev = null, next = null;
+    best.tr.s.forEach(function (st) {
+      if (st[0] <= best.seg) prev = st[1];
+      else if (next === null) next = st[1];
+    });
+    if (prev === null || next === null || prev === next) return null;
+    return [STATIONS[prev][0], STATIONS[next][0]];
+  }
+
+  // קירוב בלי נתוני מסילה: קרוב לקו הישר בין שתי התחנות הקרובות, ובין שתיהן
+  function betweenOnLine(lat, lon, a, b) {
+    var sa = STATIONS[a.i], sb = STATIONS[b.i];
+    var r = toSeg(lat, lon, sa[1], sa[2], sb[1], sb[2]);
+    return r.d <= LINE_M && r.t > 0 && r.t < 1 ? [a.n, b.n] : null;
+  }
+
+  function fmtDist(m) {
+    return m < 1000 ? Math.round(m / 10) * 10 + ' מ׳' : (m / 1000).toFixed(1) + ' ק״מ';
   }
 
   function describe(lat, lon) {
-    var t = nearestTwo(lat, lon), a = t[0], b = t[1];
-    if (a.d <= NEAR_M) return { kicker: 'תחנה', name: a.n, q: false, d: a.d };
-    return { kicker: 'בדרך, בין', name: a.n + ' ל' + b.n, q: false, d: a.d, between: true };
+    var list = stationsByDistance(lat, lon), a = list[0];
+    if (a.d <= NEAR_M) return { kicker: 'תחנה', name: a.n, d: a.d };
+    var pair = (typeof TRACKS !== 'undefined' && TRACKS) ? betweenOnTrack(lat, lon)
+                                                          : betweenOnLine(lat, lon, a, list[1]);
+    if (pair) return { kicker: 'בדרך, בין', name: pair[0] + ' ל' + pair[1], d: a.d, between: true };
+    return { kicker: 'התחנה הקרובה ביותר', name: a.n, d: a.d, far: true };
   }
 
   function show(o) {
@@ -87,7 +134,8 @@
       btn.classList.remove('busy');
       var r = describe(pos.coords.latitude, pos.coords.longitude);
       var acc = Math.round(pos.coords.accuracy);
-      r.note = acc > 500 ? 'דיוק נמוך (±' + acc + ' מ׳), נסה שוב ליד החלון' : 'לחץ לרענון';
+      r.note = acc > 500 ? 'דיוק נמוך (±' + acc + ' מ׳), נסה שוב ליד החלון' :
+               r.far ? fmtDist(r.d) + ' ממך · לחץ לרענון' : 'לחץ לרענון';
       show(r);
     }, function (err) {
       btn.classList.remove('busy');

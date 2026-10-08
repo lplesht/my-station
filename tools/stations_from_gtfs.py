@@ -5,7 +5,7 @@ Usage:
   python3 tools/stations_from_gtfs.py --download              # fetch the MOT feed
   python3 tools/stations_from_gtfs.py path/to/gtfs.zip        # use a local copy
 
-Writes stations.js (unless --dry-run) and prints a report comparing the
+Writes stations.js and tracks.js (unless --dry-run) and prints a report comparing the
 new list with the current one: stations that moved, were added or removed.
 
 Rail stops are found by following routes with route_type 2 (or the Israel
@@ -58,7 +58,19 @@ def rail_stations(zip_path):
                   if r.get("route_type", "").strip() == "2" or r.get("agency_id") in rail_agencies}
         if not routes:
             sys.exit("No rail routes found in feed (route_type 2 / Israel Railways agency).")
-        trips = {t["trip_id"] for t in rows(zf, "trips.txt") if t["route_id"] in routes}
+        trips, shape_ids = set(), set()
+        for t in rows(zf, "trips.txt"):
+            if t["route_id"] in routes:
+                trips.add(t["trip_id"])
+                if t.get("shape_id"):
+                    shape_ids.add(t["shape_id"])
+        shapes = {}
+        if shape_ids and "shapes.txt" in names:
+            for sp in rows(zf, "shapes.txt"):  # large file: streamed
+                if sp["shape_id"] in shape_ids:
+                    shapes.setdefault(sp["shape_id"], []).append(
+                        (int(sp["shape_pt_sequence"]), float(sp["shape_pt_lat"]), float(sp["shape_pt_lon"])))
+        shapes = [[(lat, lon) for _, lat, lon in sorted(pts)] for pts in shapes.values()]
         stop_ids = set()
         for st in rows(zf, "stop_times.txt"):  # large file: streamed, not loaded
             if st["trip_id"] in trips:
@@ -90,7 +102,93 @@ def rail_stations(zip_path):
         lon = sum(float(s["stop_lon"]) for s in group) / len(group)
         out.append((name, round(lat, 5), round(lon, 5)))
     out.sort(key=lambda s: -s[1])  # north to south
-    return out, feed_date
+    return out, shapes, feed_date
+
+
+# --- tracks: rail shapes, simplified and de-duplicated -----------------------
+
+SIMPLIFY_M = 15      # Douglas-Peucker tolerance
+CELL_M = 60          # grid used to drop shapes that run over already-kept track
+STATION_ON_TRACK_M = 200
+
+
+def to_xy(lat, lon, lat0):
+    return lon * 111320 * math.cos(lat0 * math.pi / 180), lat * 110540
+
+
+def simplify(pts, tol):
+    lat0 = pts[0][0]
+    xy = [to_xy(a, b, lat0) for a, b in pts]
+    keep = [False] * len(pts)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(pts) - 1)]
+    while stack:
+        i, j = stack.pop()
+        (x1, y1), (x2, y2) = xy[i], xy[j]
+        dx, dy = x2 - x1, y2 - y1
+        L = math.hypot(dx, dy) or 1e-9
+        best, bi = 0, None
+        for k in range(i + 1, j):
+            d = abs(dy * (xy[k][0] - x1) - dx * (xy[k][1] - y1)) / L
+            if d > best:
+                best, bi = d, k
+        if bi is not None and best > tol:
+            keep[bi] = True
+            stack += [(i, bi), (bi, j)]
+    return [p for p, k in zip(pts, keep) if k]
+
+
+def dense(pts, step=20):
+    """Points every ~step metres along the polyline (for coverage tests)."""
+    out = [pts[0]]
+    for (a1, b1), (a2, b2) in zip(pts, pts[1:]):
+        n = max(1, int(dist(a1, b1, a2, b2) / step))
+        out += [(a1 + (a2 - a1) * t / n, b1 + (b2 - b1) * t / n) for t in range(1, n + 1)]
+    return out
+
+
+def cell(lat, lon):
+    x, y = to_xy(lat, lon, 31.5)
+    return int(x // CELL_M), int(y // CELL_M)
+
+
+def build_tracks(shapes, stations):
+    covered, tracks = set(), []
+    for pts in sorted(shapes, key=len, reverse=True):
+        if len(pts) < 2:
+            continue
+        d = dense(pts)
+        if sum(cell(*p) in covered for p in d) >= 0.98 * len(d):
+            continue  # this route runs entirely over track we already have
+        for p in d:
+            cx, cy = cell(*p)
+            covered.update((cx + i, cy + j) for i in (-1, 0, 1) for j in (-1, 0, 1))
+        line = simplify(pts, SIMPLIFY_M)
+        # stations lying on this track, attached to their nearest vertex
+        stops = []
+        for si, (_, slat, slon) in enumerate(stations):
+            vi, vd = min(((i, dist(slat, slon, a, b)) for i, (a, b) in enumerate(line)), key=lambda t: t[1])
+            if vd <= STATION_ON_TRACK_M:
+                stops.append((vi, si))
+        stops.sort()
+        tracks.append((line, stops))
+    return tracks
+
+
+def write_tracks_js(path, tracks, feed_date):
+    lines = [
+        "// מסלולי המסילה מתוך shapes.txt של ה-GTFS הרשמי"
+        + (f" (גרסה {feed_date})" if feed_date else "") + ", מפושטים לדיוק ~15 מ׳.",
+        "// p: קו רוחב/אורך לסירוגין. s: [אינדקס נקודה במסלול, אינדקס תחנה ב-STATIONS].",
+        "// נוצר אוטומטית: python3 tools/stations_from_gtfs.py --download",
+        "const TRACKS = [",
+    ]
+    for line, stops in tracks:
+        flat = ",".join(f"{a:.5f},{b:.5f}" for a, b in line)
+        st = ",".join(f"[{v},{s}]" for v, s in stops)
+        lines.append(f"{{p:[{flat}],s:[{st}]}},")
+    lines.append("];")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def read_current(path):
@@ -157,12 +255,19 @@ def main():
     if not zip_path:
         p.error("give a GTFS zip path or --download")
 
-    new, feed_date = rail_stations(zip_path)
+    new, shapes, feed_date = rail_stations(zip_path)
     out = Path(a.out)
     report(read_current(out) if out.exists() else [], new)
+    tracks = build_tracks(shapes, new)
+    print(f"\nTracks: {len(shapes)} rail shapes in feed, {len(tracks)} kept after de-duplication, "
+          f"{sum(len(t[0]) for t in tracks)} points")
     if not a.dry_run:
         write_js(out, new, feed_date)
-        print(f"\nWrote {len(new)} stations to {out}")
+        print(f"Wrote {len(new)} stations to {out}")
+        if tracks:
+            tracks_out = out.with_name("tracks.js")
+            write_tracks_js(tracks_out, tracks, feed_date)
+            print(f"Wrote tracks to {tracks_out}")
 
 
 if __name__ == "__main__":
