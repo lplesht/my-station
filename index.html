@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="איפה אני">
+<meta name="theme-color" content="#0b1d2e">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<title>באיזו תחנה אני?</title>
+<style>
+  :root { --bg:#0b1d2e; --ring:#2f8cff; --ink:#ffffff; --sub:#9fb6cc; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; margin:0; background:var(--bg); color:var(--ink);
+    font-family:-apple-system,"Segoe UI",Arial,sans-serif; overscroll-behavior:none; }
+  body { display:flex; align-items:center; justify-content:center;
+    padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom); }
+  #btn { width:min(86vw,420px); aspect-ratio:1; border-radius:50%; border:6px solid var(--ring);
+    background:radial-gradient(circle at 50% 35%, #16466f, #0e2b46); color:var(--ink);
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    padding:8%; text-align:center; cursor:pointer; font:inherit;
+    box-shadow:0 0 0 0 rgba(47,140,255,.5); transition:transform .1s; }
+  #btn:active { transform:scale(.97); }
+  #btn.busy { animation:pulse 1.4s infinite; }
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(47,140,255,.55)} 100%{box-shadow:0 0 0 38px rgba(47,140,255,0)} }
+  #kicker { font-size:clamp(14px,4vw,18px); color:var(--sub); min-height:1.3em; margin-bottom:.35em; }
+  #name { font-size:clamp(28px,10vw,52px); font-weight:800; line-height:1.15; word-break:break-word; }
+  #name.q { font-size:clamp(26px,8.5vw,44px); }
+  #note { font-size:clamp(12px,3.4vw,15px); color:var(--sub); margin-top:.7em; min-height:1.2em; }
+</style>
+</head>
+<body>
+<button id="btn" type="button" aria-live="polite">
+  <div id="kicker"></div>
+  <div id="name" class="q">באיזו תחנה אני?</div>
+  <div id="note">לחץ כדי לבדוק</div>
+</button>
+<script src="stations.js"></script>
+<script>
+(function () {
+  var NEAR_M = 1000;          // עד המרחק הזה מציגים "תחנה X"; מעבר לו "בין X ל-Y"
+  var btn = document.getElementById('btn');
+  var kicker = document.getElementById('kicker');
+  var nameEl = document.getElementById('name');
+  var note = document.getElementById('note');
+
+  function dist(lat1, lon1, lat2, lon2) {
+    var R = 6371000, r = Math.PI / 180;
+    var dLat = (lat2 - lat1) * r, dLon = (lon2 - lon1) * r;
+    var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+            Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return 2 * R * Math.asin(Math.sqrt(a));
+  }
+
+  // מחזיר את שתי התחנות הקרובות ביותר
+  function nearestTwo(lat, lon) {
+    var list = STATIONS.map(function (s) { return { n: s[0], d: dist(lat, lon, s[1], s[2]) }; });
+    list.sort(function (a, b) { return a.d - b.d; });
+    return [list[0], list[1]];
+  }
+
+  function describe(lat, lon) {
+    var t = nearestTwo(lat, lon), a = t[0], b = t[1];
+    if (a.d <= NEAR_M) return { kicker: 'תחנה', name: a.n, q: false, d: a.d };
+    return { kicker: 'בדרך, בין', name: a.n + ' ל' + b.n, q: false, d: a.d, between: true };
+  }
+
+  function show(o) {
+    kicker.textContent = o.kicker || '';
+    nameEl.textContent = o.name;
+    nameEl.className = o.q ? 'q' : '';
+    note.textContent = o.note || '';
+  }
+
+  function locate() {
+    btn.classList.add('busy');
+    show({ kicker: '', name: 'מחפש מיקום…', q: true, note: '' });
+    if (!navigator.geolocation) {
+      btn.classList.remove('busy');
+      show({ name: 'אין גישה ל-GPS', q: true, note: 'המכשיר לא תומך במיקום' });
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(function (pos) {
+      btn.classList.remove('busy');
+      var r = describe(pos.coords.latitude, pos.coords.longitude);
+      var acc = Math.round(pos.coords.accuracy);
+      r.note = acc > 500 ? 'דיוק נמוך (±' + acc + ' מ׳), נסה שוב ליד החלון' : 'לחץ לרענון';
+      show(r);
+    }, function (err) {
+      btn.classList.remove('busy');
+      var msg = err.code === 1 ? 'צריך לאשר גישה למיקום' :
+                err.code === 3 ? 'לא הצלחתי לקבל מיקום, נסה שוב' : 'המיקום לא זמין כרגע';
+      var hint = err.code === 1 ? 'הגדרות › Safari › מיקום › אפשר' : 'לחץ לנסות שוב';
+      show({ name: msg, q: true, note: hint });
+    }, { enableHighAccuracy: true, timeout: 20000, maximumAge: 3000 });
+  }
+
+  btn.addEventListener('click', locate);
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) locate();
+  });
+  locate();
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(function () {});
+  }
+  window.__describe = describe; // לבדיקות
+})();
+</script>
+</body>
+</html>
