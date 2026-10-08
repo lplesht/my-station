@@ -1,4 +1,4 @@
-const CACHE = 'rail-station-v1';
+const CACHE = 'rail-station-v2';
 const FILES = ['./', './index.html', './stations.js', './manifest.webmanifest', './icon-180.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {
@@ -15,17 +15,23 @@ self.addEventListener('activate', (e) => {
 
 // קודם מהמטמון (עובד בלי אינטרנט), ובמקביל מרענן ברקע כשיש רשת
 self.addEventListener('fetch', (e) => {
-  if (e.request.method !== 'GET') return;
+  const req = e.request;
+  if (req.method !== 'GET' || new URL(req.url).origin !== self.location.origin) return;
+  const net = fetch(req).then((res) => {
+    // תגובה שעברה הפניה (redirect) לא תקינה לניווט ב-Safari, לכן לא שומרים אותה
+    if (res && res.ok && !res.redirected) {
+      const copy = res.clone();
+      return caches.open(CACHE).then((c) => c.put(req, copy)).then(() => res);
+    }
+    return res;
+  });
+  e.waitUntil(net.catch(() => {}));
   e.respondWith(
-    caches.match(e.request, { ignoreSearch: true }).then((hit) => {
-      const net = fetch(e.request).then((res) => {
-        if (res && res.ok) {
-          const copy = res.clone();
-          caches.open(CACHE).then((c) => c.put(e.request, copy));
-        }
-        return res;
-      }).catch(() => hit);
-      return hit || net;
-    })
+    caches.match(req, { ignoreSearch: true }).then((hit) =>
+      hit || net.catch(() =>
+        // בלי רשת ובלי עותק: פתיחת האפליקציה תמיד מחזירה את הדף הראשי
+        req.mode === 'navigate' ? caches.match('./index.html') : Response.error()
+      )
+    )
   );
 });
