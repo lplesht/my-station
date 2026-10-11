@@ -29,8 +29,10 @@
   #kicker { font-size:clamp(14px,4vw,18px); color:var(--sub); min-height:1.3em; margin-bottom:.35em; }
   #name { font-size:clamp(28px,10vw,52px); font-weight:800; line-height:1.15; word-break:break-word; }
   #name.q { font-size:clamp(26px,8.5vw,44px); }
-  #note { font-size:clamp(12px,3.4vw,15px); color:var(--sub); margin-top:.7em; min-height:1.2em; }
-  #dbg { position:fixed; left:0; right:0; bottom:0; margin:0; padding:10px 16px calc(10px + env(safe-area-inset-bottom));
+  #note { font-size:clamp(12px,3.4vw,15px); color:var(--sub); margin-top:.7em; min-height:1.2em; white-space:pre-line; line-height:1.4; }
+  #credit { position:fixed; left:0; right:0; bottom:0; text-align:center; font-size:10px; color:#5d7890;
+    padding:4px 8px calc(4px + env(safe-area-inset-bottom)); pointer-events:none; }
+  #dbg { position:fixed; left:0; right:0; bottom:26px; margin:0; padding:10px 16px calc(10px + env(safe-area-inset-bottom));
     direction:ltr; text-align:left; font:12px/1.5 ui-monospace,Menlo,monospace; color:var(--sub);
     background:rgba(0,0,0,.35); white-space:pre-wrap; }
 </style>
@@ -42,13 +44,19 @@
   <div id="note">לחץ כדי לבדוק</div>
 </button>
 <pre id="dbg" hidden></pre>
+<div id="credit">תחנות: משרד התחבורה · מסילות: © תורמי OpenStreetMap</div>
 <script src="stations.js"></script>
 <script src="tracks.js"></script>
 <script>
 (function () {
-  var NEAR_M = 1000;          // עד המרחק הזה מציגים "תחנה X"
-  var ON_TRACK_M = 300;       // ברירת מחדל; tracks.js יכול לקבוע TRACKS_TOL משלו
+  var NEAR_M = 400;           // עד המרחק הזה מתחנה: "תחנה X"
   var LINE_M = 700;           // בלי נתוני מסילה: מרחק מותר מהקו הישר בין שתי תחנות
+  var STALE_MS = 45000;       // בלי עדכון מיקום מעבר לזה: התוצאה מסומנת כישנה
+  var MAX_ACC_M = 150;        // דגימה גרועה מזה נדחית אם יש דגימה טובה מלפני פחות מ-GOOD_MS
+  var GOOD_MS = 20000;
+  var DIR_MIN_M = 40;         // כמה מטרים צריך להתקדם לאורך המסילה כדי לקבוע כיוון
+  var DIR_MIN_AGE_MS = 8000;  // מול דגימה ישנה לפחות כל כך
+  var DIR_WINDOW_MS = 60000;
   var btn = document.getElementById('btn');
   var kicker = document.getElementById('kicker');
   var nameEl = document.getElementById('name');
@@ -85,45 +93,120 @@
     return list;
   }
 
-  // על המסילה? מחזיר את שתי התחנות הסמוכות לאורך המסילה, או null
-  function betweenOnTrack(lat, lon) {
-    var best = null;
-    TRACKS.forEach(function (tr) {
-      var p = tr.p;
-      for (var k = 0; k + 3 < p.length; k += 2) {
-        var r = toSeg(lat, lon, p[k], p[k + 1], p[k + 2], p[k + 3]);
-        if (!best || r.d < best.d) best = { d: r.d, tr: tr, seg: k / 2 };
-      }
-    });
-    var tol = typeof TRACKS_TOL !== 'undefined' ? TRACKS_TOL : ON_TRACK_M;
-    if (!best || best.d > tol) return null;
-    var prev = null, next = null;
-    best.tr.s.forEach(function (st) {
-      if (st[0] <= best.seg) prev = st[1];
-      else if (next === null) next = st[1];
-    });
-    if (prev === null || next === null || prev === next) return null;
-    return [STATIONS[prev][0], STATIONS[next][0]];
+  function fmtDist(m) {
+    return m < 1000 ? Math.round(m / 10) * 10 + ' מ׳' : (m / 1000).toFixed(1) + ' ק״מ';
   }
 
-  // קירוב בלי נתוני מסילה: קרוב לקו הישר בין שתי התחנות הקרובות, ובין שתיהן
+  function clock(t) {
+    var d = new Date(t), p = function (n) { return (n < 10 ? '0' : '') + n; };
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
+  // --- רשת המסילות: כל קטע בין שתי תחנות עוקבות, עם אורך מצטבר לאורך הקטע ---
+  var NET = [];
+  if (typeof TRACKS !== 'undefined' && TRACKS) {
+    TRACKS.forEach(function (tr, id) {
+      var p = tr.p, n = p.length / 2, cum = [0];
+      for (var i = 1; i < n; i++) cum.push(cum[i - 1] + dist(p[2 * i - 2], p[2 * i - 1], p[2 * i], p[2 * i + 1]));
+      NET.push({ id: id, p: p, cum: cum, len: cum[n - 1], a: tr.s[0][1], b: tr.s[tr.s.length - 1][1], tol: tr.t || 300 });
+    });
+  }
+
+  // לכל קטע: הנקודה הקרובה ביותר אליו, והמרחק לאורך הקטע (מהתחנה a) עד אליה
+  function snapAll(lat, lon) {
+    return NET.map(function (tr) {
+      var p = tr.p, best = null;
+      for (var k = 0, i = 0; k + 3 < p.length; k += 2, i++) {
+        var r = toSeg(lat, lon, p[k], p[k + 1], p[k + 2], p[k + 3]);
+        if (!best || r.d < best.d) best = { d: r.d, i: i, t: Math.max(0, Math.min(1, r.t)) };
+      }
+      return { tr: tr, d: best.d, s: tr.cum[best.i] + best.t * (tr.cum[best.i + 1] - tr.cum[best.i]) };
+    });
+  }
+
+  // הקטע שעליו אנחנו. סבולת: לפחות זו של הקטע, ועד 1.5 מדיוק ה-GPS. נצמדים לקטע הקודם בצמתים
+  function pickTrack(lat, lon, acc, prevId) {
+    var slack = Math.min(acc * 1.5, 400);
+    var cands = snapAll(lat, lon).filter(function (c) { return c.d <= Math.max(c.tr.tol, slack); });
+    if (!cands.length) return null;
+    cands.sort(function (x, y) { return x.d - y.d; });
+    var best = cands[0];
+    if (prevId !== null) cands.forEach(function (c) { if (c.tr.id === prevId && c.d <= best.d + 60) best = c; });
+    return best;
+  }
+
+  // בלי נתוני מסילה: קירוב. קרוב לקו הישר בין שתי התחנות הקרובות, ובין שתיהן
   function betweenOnLine(lat, lon, a, b) {
     var sa = STATIONS[a.i], sb = STATIONS[b.i];
     var r = toSeg(lat, lon, sa[1], sa[2], sb[1], sb[2]);
     return r.d <= LINE_M && r.t > 0 && r.t < 1 ? [a.n, b.n] : null;
   }
 
-  function fmtDist(m) {
-    return m < 1000 ? Math.round(m / 10) * 10 + ' מ׳' : (m / 1000).toFixed(1) + ' ק״מ';
+  function classify(lat, lon, acc, prevTrackId, prevStation) {
+    var list = stationsByDistance(lat, lon), a = list[0];
+    if (a.d <= NEAR_M || (prevStation === a.i && a.d <= NEAR_M + 150)) return { kind: 'station', a: a };
+    if (NET.length) {
+      var c = pickTrack(lat, lon, acc, prevTrackId);
+      if (c) return { kind: 'track', a: a, c: c };
+    } else {
+      var pair = betweenOnLine(lat, lon, a, list[1]);
+      if (pair) return { kind: 'between', a: a, pair: pair };
+    }
+    return { kind: 'off', a: a };
   }
 
-  function describe(lat, lon) {
-    var list = stationsByDistance(lat, lon), a = list[0];
-    if (a.d <= NEAR_M) return { kicker: 'תחנה', name: a.n, d: a.d };
-    var pair = (typeof TRACKS !== 'undefined' && TRACKS) ? betweenOnTrack(lat, lon)
-                                                          : betweenOnLine(lat, lon, a, list[1]);
-    if (pair) return { kicker: 'בדרך, בין', name: pair[0] + ' ל' + pair[1], d: a.d, between: true };
+  // dir: { toward: אינדקס התחנה הבאה, rem: מטרים עד אליה } או null כשהכיוון לא ידוע
+  function display(k, dir) {
+    var a = k.a;
+    if (k.kind === 'station') return { kicker: 'תחנה', name: a.n, d: a.d };
+    if (k.kind === 'between') return { kicker: 'בדרך, בין', name: k.pair[0] + ' ל' + k.pair[1], d: a.d, between: true };
+    if (k.kind === 'track') {
+      var tr = k.c.tr;
+      if (dir) return { kicker: 'התחנה הבאה', name: STATIONS[dir.toward][0], d: a.d, between: true, rem: dir.rem };
+      return { kicker: 'בדרך, בין', name: STATIONS[tr.a][0] + ' ל' + STATIONS[tr.b][0], d: a.d, between: true };
+    }
     return { kicker: 'התחנה הקרובה ביותר', name: a.n, d: a.d, far: true };
+  }
+
+  function describe(lat, lon, acc) {   // ללא היסטוריה (כיוון); לבדיקות
+    return display(classify(lat, lon, acc || 0, null, null), null);
+  }
+
+  // --- כיוון נסיעה: לפי התקדמות לאורך הקטע בין דגימות, לא דגימה בודדת ---
+  var hist = [], dirMemo = null, curTrack = null, curStation = null;
+
+  function updateDir(c, acc, now) {
+    if (curTrack !== c.tr.id) {
+      // עברנו לקטע אחר: אם הגענו לתחנה שפנינו אליה, ממשיכים לקצה השני של הקטע החדש
+      if (dirMemo && (c.tr.a === dirMemo.toward || c.tr.b === dirMemo.toward)) {
+        dirMemo = { toward: c.tr.a === dirMemo.toward ? c.tr.b : c.tr.a, at: now, speed: dirMemo.speed };
+      } else dirMemo = null;
+      hist = [];
+      curTrack = c.tr.id;
+    }
+    hist.push({ s: c.s, at: now });
+    hist = hist.filter(function (h) { return now - h.at <= DIR_WINDOW_MS; });
+    // הדגימה הכי עדכנית שמספיק ישנה והתקדמנו ממנה מספיק: כך גם היפוך כיוון מזוהה מהר
+    var thr = Math.max(DIR_MIN_M, 1.5 * acc);
+    for (var i = hist.length - 1; i >= 0; i--) {
+      var age = now - hist[i].at;
+      if (age < DIR_MIN_AGE_MS) continue;
+      var ds = c.s - hist[i].s;
+      if (Math.abs(ds) >= thr) {
+        dirMemo = { toward: ds > 0 ? c.tr.b : c.tr.a, at: now, speed: Math.abs(ds) / (age / 1000) };
+        break;
+      }
+    }
+    if (!dirMemo || now - dirMemo.at > 600000) { dirMemo = null; return null; }
+    var rem = Math.max(0, dirMemo.toward === c.tr.b ? c.tr.len - c.s : c.s);
+    return { toward: dirMemo.toward, rem: rem, speed: dirMemo.speed };
+  }
+
+  function etaText(dir, gpsSpeed) {
+    var v = gpsSpeed > 3 ? gpsSpeed : (dir.speed > 3 ? dir.speed : 0);
+    if (!v) return '';
+    var min = Math.round(dir.rem / v / 60);
+    return ' · ' + (min < 1 ? 'פחות מדקה' : 'כ-' + min + ' דק׳');
   }
 
   function show(o) {
@@ -133,37 +216,47 @@
     note.textContent = o.note || '';
   }
 
+  var watchId = null, last = null, fixes = 0;
+
+  // ההערה מתחת לשם: מרחק/זמן לתחנה, דיוק ה-GPS ושעת העדכון; ואם המיקום לא מתעדכן, אזהרה
+  function noteText() {
+    if (Date.now() - last.at > STALE_MS) return 'אין עדכון מיקום מאז ' + clock(last.at) + ' · לחץ לרענון';
+    if (last.acc > 500) return 'דיוק נמוך (±' + last.acc + ' מ׳), נסה שוב ליד החלון';
+    var line1 = last.r.rem != null ? fmtDist(last.r.rem) + last.eta + '\n' :
+                last.r.far ? fmtDist(last.r.d) + ' ממך\n' : '';
+    return line1 + 'דיוק GPS ±' + last.acc + ' מ׳ · ' + clock(last.at);
+  }
+
   function debug(text) {
     if (!DEBUG) return;
     dbg.hidden = false;
     dbg.textContent = text;
   }
 
-  var STALE_MS = 45000;      // בלי עדכון מיקום מעבר לזה: מציינים שהתוצאה ישנה
-  var watchId = null, last = null, fixes = 0;
-
-  function clock(t) {
-    var d = new Date(t), p = function (n) { return (n < 10 ? '0' : '') + n; };
-    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
-  }
-
-  // שורת ההערה מתחת לשם: מרחק, דיוק ה-GPS ושעת העדכון האחרון; ואם המיקום לא מתעדכן, אזהרה
-  function noteText() {
-    if (Date.now() - last.at > STALE_MS) return 'אין עדכון מיקום מאז ' + clock(last.at) + ' · לחץ לרענון';
-    if (last.acc > 500) return 'דיוק נמוך (±' + last.acc + ' מ׳), נסה שוב ליד החלון';
-    return (last.r.far ? fmtDist(last.r.d) + ' ממך · ' : '') + 'דיוק GPS ±' + last.acc + ' מ׳ · ' + clock(last.at);
-  }
-
   function onPos(pos) {
     btn.classList.remove('busy');
-    fixes++;
+    var now = Date.now(), acc = Math.round(pos.coords.accuracy);
     var lat = pos.coords.latitude, lon = pos.coords.longitude;
-    last = { r: describe(lat, lon), acc: Math.round(pos.coords.accuracy), at: Date.now() };
+    // דגימה גרועה אחרי דגימה טובה לאחרונה: מתעלמים, כדי שהתצוגה לא תקפוץ
+    if (last && acc > MAX_ACC_M && now - last.at < GOOD_MS) {
+      debug('ignored fix, accuracy ' + acc + ' m (last good ' + Math.round((now - last.at) / 1000) + ' s ago)');
+      return;
+    }
+    fixes++;
+    var k = classify(lat, lon, acc, curTrack, curStation);
+    curStation = k.kind === 'station' ? k.a.i : null;
+    var dir = k.kind === 'track' ? updateDir(k.c, acc, now) : null;
+    var gps = pos.coords.speed;
+    last = { r: display(k, dir), acc: acc, at: now, eta: dir ? etaText(dir, gps) : '' };
     last.r.note = noteText();
     show(last.r);
     var near = stationsByDistance(lat, lon).slice(0, 3).map(function (s) { return s.n + '  ' + Math.round(s.d) + ' m'; });
-    debug('lat ' + lat.toFixed(5) + '\nlon ' + lon.toFixed(5) + '\naccuracy ' + last.acc + ' m' +
-          '\nfix #' + fixes + ' at ' + clock(last.at) + ', gps time ' + clock(pos.timestamp) +
+    debug('lat ' + lat.toFixed(5) + '\nlon ' + lon.toFixed(5) + '\naccuracy ' + acc + ' m' +
+          '\nfix #' + fixes + ' at ' + clock(now) + ', gps time ' + clock(pos.timestamp) + ', speed ' +
+          (gps == null ? '-' : Math.round(gps * 3.6) + ' km/h') +
+          '\n' + k.kind + (k.c ? ' track#' + k.c.tr.id + ' (' + STATIONS[k.c.tr.a][0] + ' - ' + STATIONS[k.c.tr.b][0] +
+            ') off ' + Math.round(k.c.d) + ' m, at ' + Math.round(k.c.s) + '/' + Math.round(k.c.tr.len) + ' m' : '') +
+          (dir ? '\ndirection: toward ' + STATIONS[dir.toward][0] : '') +
           (FAKE ? '\n(simulated via ?lat&lon)' : '') + '\n' + near.join('\n'));
   }
 
@@ -174,8 +267,7 @@
       stop();
       show({ name: 'צריך לאשר גישה למיקום', q: true, note: 'הגדרות › Safari › מיקום › אפשר' });
     } else if (last) {
-      // משאירים את התוצאה האחרונה; noteText יסמן אותה כישנה
-      note.textContent = noteText();
+      note.textContent = noteText();   // משאירים את התוצאה האחרונה; noteText יסמן אותה כישנה
     } else {
       show({ name: 'עדיין אין מיקום', q: true, note: 'ממשיך לנסות…' });
     }

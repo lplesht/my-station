@@ -2,11 +2,17 @@
 """Build stations.js from the official Israeli public-transport GTFS feed.
 
 Usage:
-  python3 tools/stations_from_gtfs.py --download              # fetch the MOT feed
-  python3 tools/stations_from_gtfs.py path/to/gtfs.zip        # use a local copy
+  python3 tools/stations_from_gtfs.py --download --osm        # MOT feed + OpenStreetMap tracks
+  python3 tools/stations_from_gtfs.py path/to/gtfs.zip        # use a local GTFS copy, chord tracks
+  python3 tools/stations_from_gtfs.py gtfs.zip --osm-file osm.json   # OSM data from a file
 
 Writes stations.js and tracks.js (unless --dry-run) and prints a report comparing the
 new list with the current one: stations that moved, were added or removed.
+
+Track geometry: the MOT feed has no shapes, so tracks come from OpenStreetMap
+(railway=rail, (c) OpenStreetMap contributors, ODbL). Which stations are adjacent comes from
+the official stop_times; each adjacent pair is routed along the OSM rail network. Without
+--osm, a straight chord between the two stations is used instead.
 
 Rail stops are found by following routes with route_type 2 (or the Israel
 Railways agency) through trips and stop_times, so bus stops that happen to
@@ -20,6 +26,9 @@ import json
 import math
 import re
 import sys
+import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -135,11 +144,9 @@ def rail_stations(zip_path):
     return out, shapes, pairs, feed_date
 
 
-# --- tracks: rail shapes, simplified and de-duplicated -----------------------
+# --- tracks ------------------------------------------------------------------
 
-SIMPLIFY_M = 15      # Douglas-Peucker tolerance
-CELL_M = 60          # grid used to drop shapes that run over already-kept track
-STATION_ON_TRACK_M = 200
+SIMPLIFY_M = 10      # Douglas-Peucker tolerance for OSM geometry
 
 
 def to_xy(lat, lon, lat0):
@@ -166,43 +173,6 @@ def simplify(pts, tol):
             keep[bi] = True
             stack += [(i, bi), (bi, j)]
     return [p for p, k in zip(pts, keep) if k]
-
-
-def dense(pts, step=20):
-    """Points every ~step metres along the polyline (for coverage tests)."""
-    out = [pts[0]]
-    for (a1, b1), (a2, b2) in zip(pts, pts[1:]):
-        n = max(1, int(dist(a1, b1, a2, b2) / step))
-        out += [(a1 + (a2 - a1) * t / n, b1 + (b2 - b1) * t / n) for t in range(1, n + 1)]
-    return out
-
-
-def cell(lat, lon):
-    x, y = to_xy(lat, lon, 31.5)
-    return int(x // CELL_M), int(y // CELL_M)
-
-
-def build_tracks(shapes, stations):
-    covered, tracks = set(), []
-    for pts in sorted(shapes, key=len, reverse=True):
-        if len(pts) < 2:
-            continue
-        d = dense(pts)
-        if sum(cell(*p) in covered for p in d) >= 0.98 * len(d):
-            continue  # this route runs entirely over track we already have
-        for p in d:
-            cx, cy = cell(*p)
-            covered.update((cx + i, cy + j) for i in (-1, 0, 1) for j in (-1, 0, 1))
-        line = simplify(pts, SIMPLIFY_M)
-        # stations lying on this track, attached to their nearest vertex
-        stops = []
-        for si, (_, slat, slon) in enumerate(stations):
-            vi, vd = min(((i, dist(slat, slon, a, b)) for i, (a, b) in enumerate(line)), key=lambda t: t[1])
-            if vd <= STATION_ON_TRACK_M:
-                stops.append((vi, si))
-        stops.sort()
-        tracks.append((line, stops))
-    return tracks
 
 
 CHORD_TOL_M = 500    # straight chords between stations only approximate the real track
@@ -245,8 +215,8 @@ def prune_detours(edges, stations):
     return sorted(edges)
 
 
-def build_adjacency_tracks(pairs, stations):
-    """One straight segment per pair of stations that follow each other on a train service."""
+def adjacent_pairs(pairs, stations):
+    """Station pairs that follow each other on a train service, minus express-skip pairs."""
     index = {n: i for i, (n, _, _) in enumerate(stations)}
     segs = [tuple(sorted((index[a], index[b]))) for a, b in pairs if a in index and b in index and a != b]  # north first
 
@@ -263,26 +233,157 @@ def build_adjacency_tracks(pairs, stations):
 
     kept = [(a, b) for a, b in segs
             if not any(c not in (a, b) and on_chord(a, b, c) for c in range(len(stations)))]
-    kept = prune_detours(set(kept), stations)
-    tracks = []
-    for a, b in kept:
-        line = [(stations[a][1], stations[a][2]), (stations[b][1], stations[b][2])]
-        tracks.append((line, [(0, a), (1, b)]))
-    return tracks, len(segs) - len(kept)
+    return prune_detours(set(kept), stations), len(segs)
 
 
-def write_tracks_js(path, tracks, feed_date, tol, source):
+def chord_track(a, b, stations):
+    line = [(stations[a][1], stations[a][2]), (stations[b][1], stations[b][2])]
+    return line, [(0, a), (1, b)], CHORD_TOL_M
+
+
+# --- OpenStreetMap rail network ----------------------------------------------
+
+OVERPASS_URLS = ["https://overpass-api.de/api/interpreter",
+                 "https://overpass.kumi.systems/api/interpreter",
+                 "https://overpass.private.coffee/api/interpreter"]
+# main rail lines only: no yards/sidings/spurs, no industrial or military branches
+OVERPASS_QUERY = ('[out:json][timeout:240];'
+                  'way["railway"="rail"]["service"!~"."]["usage"!~"industrial|military"]'
+                  '(29.3,34.2,33.5,35.95);out geom;')
+OSM_TOL_M = 200          # distance from an OSM track that counts as "on the railway"
+SNAP_MAX_M = 400         # a station must have OSM track this close
+MAX_DETOUR = 1.8         # a routed path longer than this x the straight line is not trusted
+MIN_COMPONENT = 200      # ignore disconnected scraps of track smaller than this (nodes)
+
+
+def fetch_osm():
+    data = ("data=" + urllib.parse.quote(OVERPASS_QUERY)).encode()
+    last_err = None
+    for url in OVERPASS_URLS:
+        for attempt in range(2):
+            try:
+                print(f"[osm] POST {url} (attempt {attempt + 1})", file=sys.stderr)
+                req = urllib.request.Request(url, data=data, headers={"User-Agent": "my-station-pwa/1.0"})
+                with urllib.request.urlopen(req, timeout=300) as r:
+                    return json.loads(r.read().decode("utf-8"))
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                last_err = e
+                print(f"[osm] failed: {e}", file=sys.stderr)
+                time.sleep(5)
+    sys.exit(f"OpenStreetMap download failed on every server: {last_err}")
+
+
+def osm_graph(osm):
+    nodes, adj, ways = {}, {}, 0
+    for el in osm.get("elements", []):
+        if el.get("type") != "way" or not el.get("geometry") or any(g is None for g in el["geometry"]):
+            continue
+        tags = el.get("tags", {})
+        if tags.get("railway") != "rail" or "service" in tags or tags.get("usage") in ("industrial", "military"):
+            continue   # same filter as the query, in case the file came from elsewhere
+        ways += 1
+        ids = el["nodes"]
+        for nid, g in zip(ids, el["geometry"]):
+            nodes[nid] = (g["lat"], g["lon"])
+        for u, v in zip(ids, ids[1:]):
+            w = dist(*nodes[u], *nodes[v])
+            adj.setdefault(u, []).append((v, w))
+            adj.setdefault(v, []).append((u, w))
+    # keep only the big connected components: stray fragments would trap a station snap
+    seen, keep = set(), set()
+    for start in adj:
+        if start in seen:
+            continue
+        comp, stack = [], [start]
+        seen.add(start)
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for v, _ in adj[u]:
+                if v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+        if len(comp) >= MIN_COMPONENT:
+            keep.update(comp)
+    nodes = {n: c for n, c in nodes.items() if n in keep}
+    adj = {u: [(v, w) for v, w in es if v in keep] for u, es in adj.items() if u in keep}
+    print(f"[osm] {ways} ways, {len(nodes)} track nodes in main network")
+    return nodes, adj
+
+
+def snap(lat, lon, nodes):
+    best, bd = None, SNAP_MAX_M
+    k = math.cos(lat * math.pi / 180)
+    for nid, (a, b) in nodes.items():
+        if abs(a - lat) > 0.01 or abs(b - lon) > 0.012:   # cheap pre-filter (~1 km)
+            continue
+        d = math.hypot((a - lat) * 110540, (b - lon) * 111320 * k)
+        if d < bd:
+            best, bd = nid, d
+    return best, bd
+
+
+def route(adj, src, dst):
+    best, prev, heap = {src: 0.0}, {}, [(0.0, src)]
+    while heap:
+        d, u = heapq.heappop(heap)
+        if u == dst:
+            path = [u]
+            while path[-1] != src:
+                path.append(prev[path[-1]])
+            return path[::-1], d
+        if d > best[u]:
+            continue
+        for v, w in adj[u]:
+            if d + w < best.get(v, float("inf")):
+                best[v] = d + w
+                prev[v] = u
+                heapq.heappush(heap, (d + w, v))
+    return None, None
+
+
+def osm_tracks(pairs, stations, osm):
+    nodes, adj = osm_graph(osm)
+    snapped = {}
+    for i, (name, lat, lon) in enumerate(stations):
+        snapped[i] = snap(lat, lon, nodes)
+    far = [(stations[i][0], round(d)) for i, (n, d) in snapped.items() if n is not None and d > 150]
+    missing = [stations[i][0] for i, (n, d) in snapped.items() if n is None]
+    print(f"[osm] stations snapped >150 m from track: {far}")
+    print(f"[osm] stations with NO track within {SNAP_MAX_M} m: {missing}")
+    tracks, fallbacks, ratios = [], [], []
+    for a, b in pairs:
+        (na, _), (nb, _) = snapped[a], snapped[b]
+        chord = dist(stations[a][1], stations[a][2], stations[b][1], stations[b][2])
+        path, length = route(adj, na, nb) if na is not None and nb is not None else (None, None)
+        if path is None or length > MAX_DETOUR * chord:
+            fallbacks.append((stations[a][0], stations[b][0], "no path" if path is None else f"path {length / 1000:.1f} km vs chord {chord / 1000:.1f} km"))
+            tracks.append(chord_track(a, b, stations))
+            continue
+        ratios.append((length / chord, stations[a][0], stations[b][0]))
+        line = simplify([nodes[n] for n in path], SIMPLIFY_M)
+        tracks.append((line, [(0, a), (len(line) - 1, b)], OSM_TOL_M))
+    ratios.sort(reverse=True)
+    print(f"[osm] routed {len(ratios)} of {len(pairs)} segments along real track, {len(fallbacks)} fell back to a straight chord")
+    for f in fallbacks:
+        print("[osm]   chord fallback:", *f)
+    print("[osm] most winding segments (path / straight line):",
+          [f"{a}-{b} x{r:.2f}" for r, a, b in ratios[:6]])
+    return tracks
+
+
+def write_tracks_js(path, tracks, feed_date, source):
     lines = [
         f"// {source}" + (f" (גרסה {feed_date})" if feed_date else "") + ".",
-        "// p: קו רוחב/אורך לסירוגין. s: [אינדקס נקודה במסלול, אינדקס תחנה ב-STATIONS].",
-        "// נוצר אוטומטית: python3 tools/stations_from_gtfs.py --download",
-        f"const TRACKS_TOL = {tol};  // עד כמה מטרים מהמסלול נחשבים \"על המסילה\"",
+        "// p: קו רוחב/אורך לסירוגין. s: [אינדקס נקודה, אינדקס תחנה ב-STATIONS] לשתי קצוות הקטע.",
+        "// t: עד כמה מטרים מהקטע נחשבים \"על המסילה\".",
+        "// נוצר אוטומטית: python3 tools/stations_from_gtfs.py --download --osm",
         "const TRACKS = [",
     ]
-    for line, stops in tracks:
+    for line, stops, tol in tracks:
         flat = ",".join(f"{a:.5f},{b:.5f}" for a, b in line)
         st = ",".join(f"[{v},{s}]" for v, s in stops)
-        lines.append(f"{{p:[{flat}],s:[{st}]}},")
+        lines.append(f"{{p:[{flat}],s:[{st}],t:{tol}}},")
     lines.append("];")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -339,6 +440,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("zip", nargs="?", help="path to a GTFS zip")
     p.add_argument("--download", action="store_true", help=f"download {GTFS_URL}")
+    p.add_argument("--osm", action="store_true", help="download rail tracks from OpenStreetMap (Overpass)")
+    p.add_argument("--osm-file", help="use OSM data from this Overpass JSON file instead of downloading")
     p.add_argument("--out", default=str(ROOT / "stations.js"))
     p.add_argument("--dry-run", action="store_true", help="only print the report")
     a = p.parse_args()
@@ -355,25 +458,25 @@ def main():
     out = Path(a.out)
     report(read_current(out) if out.exists() else [], new)
     if shapes:
-        tracks = build_tracks(shapes, new)
-        tol, source = 250, "מסלולי המסילה מתוך shapes.txt של ה-GTFS הרשמי, מפושטים לדיוק ~15 מ׳"
-        print(f"\nTracks: {len(shapes)} rail shapes in feed, {len(tracks)} kept after de-duplication, "
-              f"{sum(len(t[0]) for t in tracks)} points")
+        print(f"\nNote: the feed contains {len(shapes)} rail shapes, but they are not used (OSM tracks are).")
+
+    kept, total = adjacent_pairs(pairs, new)
+    print(f"\nAdjacent stations: {total} pairs from stop_times, {total - len(kept)} express/skip pairs dropped, {len(kept)} kept")
+    if a.osm_file or a.osm:
+        osm = json.loads(Path(a.osm_file).read_text(encoding="utf-8")) if a.osm_file else fetch_osm()
+        tracks = osm_tracks(kept, new, osm)
+        source = ("מסילות: © תורמי OpenStreetMap (ODbL), מנותבות בין כל שתי תחנות עוקבות; "
+                  "התחנות והסדר ביניהן מה-GTFS הרשמי")
     else:
-        tracks, skipped = build_adjacency_tracks(pairs, new)
-        tol, source = CHORD_TOL_M, ("ה-GTFS הרשמי לא כולל מסלולי מסילה (shapes). כאן: קו ישר בין כל שתי תחנות "
-                                    "עוקבות בשירות רכבת אמיתי, מתוך stop_times")
-        print(f"\nNo shapes in feed: {len(pairs)} adjacent station pairs from stop_times, "
-              f"{skipped} skip-stop pairs dropped, {len(tracks)} segments kept")
-        for t in tracks:
-            print("  ", new[t[1][0][1]][0], "-", new[t[1][1][1]][0])
+        tracks = [chord_track(a_, b_, new) for a_, b_ in kept]
+        source = "קו ישר בין כל שתי תחנות עוקבות בשירות רכבת אמיתי (stop_times ב-GTFS הרשמי); אין נתוני מסילה"
+    print(f"Tracks: {len(tracks)} segments, {sum(len(t[0]) for t in tracks)} points")
     if not a.dry_run:
         write_js(out, new, feed_date)
         print(f"Wrote {len(new)} stations to {out}")
-        if tracks:
-            tracks_out = out.with_name("tracks.js")
-            write_tracks_js(tracks_out, tracks, feed_date, tol, source)
-            print(f"Wrote tracks to {tracks_out}")
+        tracks_out = out.with_name("tracks.js")
+        write_tracks_js(tracks_out, tracks, feed_date, source)
+        print(f"Wrote tracks to {tracks_out}")
 
 
 if __name__ == "__main__":

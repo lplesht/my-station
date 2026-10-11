@@ -1,6 +1,6 @@
 name: Update stations from GTFS
 
-# Run manually from the Actions tab. Downloads the official MOT GTFS feed,
+# Run manually from the Actions tab. Downloads the official MOT GTFS feed and OpenStreetMap rail tracks,
 # regenerates stations.js and commits it if anything changed.
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Build stations.js
-        run: python3 tools/stations_from_gtfs.py --download | tee report.txt
+        run: python3 tools/stations_from_gtfs.py --download --osm | tee report.txt
       - name: Report
         run: |
           { echo '```'; cat report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
