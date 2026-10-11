@@ -58,19 +58,31 @@ def rail_stations(zip_path):
                   if r.get("route_type", "").strip() == "2" or r.get("agency_id") in rail_agencies}
         if not routes:
             sys.exit("No rail routes found in feed (route_type 2 / Israel Railways agency).")
-        trips, shape_ids = set(), set()
+        trips, shape_ids, trip_cols = set(), set(), []
         for t in rows(zf, "trips.txt"):
+            trip_cols = list(t)
             if t["route_id"] in routes:
                 trips.add(t["trip_id"])
                 if t.get("shape_id"):
                     shape_ids.add(t["shape_id"])
-        shapes = {}
+        shapes, shape_rows, shape_cols, shape_sample = {}, 0, [], []
         if shape_ids and "shapes.txt" in names:
             for sp in rows(zf, "shapes.txt"):  # large file: streamed
+                shape_rows += 1
+                if not shape_cols:
+                    shape_cols = list(sp)
+                if len(shape_sample) < 3:
+                    shape_sample.append(sp["shape_id"])
                 if sp["shape_id"] in shape_ids:
                     shapes.setdefault(sp["shape_id"], []).append(
-                        (int(sp["shape_pt_sequence"]), float(sp["shape_pt_lat"]), float(sp["shape_pt_lon"])))
+                        (int(float(sp["shape_pt_sequence"])), float(sp["shape_pt_lat"]), float(sp["shape_pt_lon"])))
         shapes = [[(lat, lon) for _, lat, lon in sorted(pts)] for pts in shapes.values()]
+        print("[diag] files in feed:", sorted(names))
+        print(f"[diag] rail agencies: {sorted(rail_agencies)}  rail routes: {len(routes)}  rail trips: {len(trips)}")
+        print(f"[diag] trips.txt columns: {trip_cols}")
+        print(f"[diag] rail trips with a shape_id: {len(shape_ids)}  e.g. {sorted(shape_ids)[:3]}")
+        print(f"[diag] shapes.txt rows: {shape_rows}  columns: {shape_cols}  first ids: {shape_sample}")
+        print(f"[diag] rail shapes matched: {len(shapes)}")
         stop_ids = set()
         for st in rows(zf, "stop_times.txt"):  # large file: streamed, not loaded
             if st["trip_id"] in trips:
