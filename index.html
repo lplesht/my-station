@@ -132,7 +132,7 @@
     cands.sort(function (x, y) { return x.d - y.d; });
     var best = cands[0];
     if (prevId !== null) cands.forEach(function (c) { if (c.tr.id === prevId && c.d <= best.d + 60) best = c; });
-    return best;
+    return { best: best, cands: cands };
   }
 
   // בלי נתוני מסילה: קירוב. קרוב לקו הישר בין שתי התחנות הקרובות, ובין שתיהן
@@ -146,8 +146,8 @@
     var list = stationsByDistance(lat, lon), a = list[0];
     if (a.d <= NEAR_M || (prevStation === a.i && a.d <= NEAR_M + 150)) return { kind: 'station', a: a };
     if (NET.length) {
-      var c = pickTrack(lat, lon, acc, prevTrackId);
-      if (c) return { kind: 'track', a: a, c: c };
+      var pk = pickTrack(lat, lon, acc, prevTrackId);
+      if (pk) return { kind: 'track', a: a, c: pk.best, cands: pk.cands };
     } else {
       var pair = betweenOnLine(lat, lon, a, list[1]);
       if (pair) return { kind: 'between', a: a, pair: pair };
@@ -162,7 +162,14 @@
     if (k.kind === 'between') return { kicker: 'בדרך, בין', name: k.pair[0] + ' ל' + k.pair[1], d: a.d, between: true };
     if (k.kind === 'track') {
       var tr = k.c.tr;
-      if (dir) return { kicker: 'התחנה הבאה', name: STATIONS[dir.toward][0], d: a.d, between: true, rem: dir.rem };
+      if (dir) {
+        var names = [STATIONS[dir.toward][0]], rem = dir.rem;
+        (dir.alts || []).forEach(function (x) {
+          if (names.indexOf(STATIONS[x.toward][0]) < 0) names.push(STATIONS[x.toward][0]);
+          rem = Math.min(rem, x.rem);
+        });
+        return { kicker: 'התחנה הבאה', name: names.join(' / '), d: a.d, between: true, rem: rem };
+      }
       return { kicker: 'בדרך, בין', name: STATIONS[tr.a][0] + ' ל' + STATIONS[tr.b][0], d: a.d, between: true };
     }
     return { kicker: 'התחנה הקרובה ביותר', name: a.n, d: a.d, far: true };
@@ -179,7 +186,11 @@
     if (curTrack !== c.tr.id) {
       // עברנו לקטע אחר: אם הגענו לתחנה שפנינו אליה, ממשיכים לקצה השני של הקטע החדש
       if (dirMemo && (c.tr.a === dirMemo.toward || c.tr.b === dirMemo.toward)) {
-        dirMemo = { toward: c.tr.a === dirMemo.toward ? c.tr.b : c.tr.a, at: now, speed: dirMemo.speed };
+        var nt = c.tr.a === dirMemo.toward ? c.tr.b : c.tr.a;
+        dirMemo = { toward: nt, from: dirMemo.toward, at: now, speed: dirMemo.speed };
+      } else if (dirMemo && dirMemo.from !== undefined && (c.tr.a === dirMemo.from || c.tr.b === dirMemo.from)) {
+        // אותה תחנת מוצא, ענף אחר (שני הענפים התחילו על אותה מסילה): ממשיכים לקצה השני
+        dirMemo = { toward: c.tr.a === dirMemo.from ? c.tr.b : c.tr.a, from: dirMemo.from, at: now, speed: dirMemo.speed };
       } else dirMemo = null;
       hist = [];
       curTrack = c.tr.id;
@@ -193,13 +204,26 @@
       if (age < DIR_MIN_AGE_MS) continue;
       var ds = c.s - hist[i].s;
       if (Math.abs(ds) >= thr) {
-        dirMemo = { toward: ds > 0 ? c.tr.b : c.tr.a, at: now, speed: Math.abs(ds) / (age / 1000) };
+        var to = ds > 0 ? c.tr.b : c.tr.a;
+        dirMemo = { toward: to, from: to === c.tr.b ? c.tr.a : c.tr.b, at: now, speed: Math.abs(ds) / (age / 1000) };
         break;
       }
     }
     if (!dirMemo || now - dirMemo.at > 600000) { dirMemo = null; return null; }
     var rem = Math.max(0, dirMemo.toward === c.tr.b ? c.tr.len - c.s : c.s);
     return { toward: dirMemo.toward, rem: rem, speed: dirMemo.speed };
+  }
+
+  // כמה ענפים עוברים באותו מקום (עוד לפני שנפרדו): התחנה הבאה תלויה בקו, ומציגים את כולן
+  function alternatives(k, dir) {
+    var tr = k.c.tr, from = dir.toward === tr.b ? tr.a : tr.b, out = [];
+    (k.cands || []).forEach(function (x) {
+      if (x.tr.id === tr.id || x.d > k.c.d + 40) return;
+      if (x.tr.a !== from && x.tr.b !== from) return;
+      var to = x.tr.a === from ? x.tr.b : x.tr.a;
+      if (to !== dir.toward) out.push({ toward: to, rem: Math.max(0, to === x.tr.b ? x.tr.len - x.s : x.s) });
+    });
+    return out;
   }
 
   function etaText(dir, gpsSpeed) {
@@ -246,6 +270,7 @@
     var k = classify(lat, lon, acc, curTrack, curStation);
     curStation = k.kind === 'station' ? k.a.i : null;
     var dir = k.kind === 'track' ? updateDir(k.c, acc, now) : null;
+    if (dir) dir.alts = alternatives(k, dir);
     var gps = pos.coords.speed;
     last = { r: display(k, dir), acc: acc, at: now, eta: dir ? etaText(dir, gps) : '' };
     last.r.note = noteText();

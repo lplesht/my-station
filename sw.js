@@ -1,4 +1,4 @@
-const CACHE = 'rail-station-v6';
+const CACHE = 'rail-station-v7';
 const FILES = ['./', './index.html', './stations.js', './tracks.js', './manifest.webmanifest', './icon-180.png', './icon-512.png'];
 
 self.addEventListener('install', (e) => {
