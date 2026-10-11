@@ -30,6 +30,9 @@
   #name { font-size:clamp(28px,10vw,52px); font-weight:800; line-height:1.15; word-break:break-word; }
   #name.q { font-size:clamp(26px,8.5vw,44px); }
   #note { font-size:clamp(12px,3.4vw,15px); color:var(--sub); margin-top:.7em; min-height:1.2em; }
+  #dbg { position:fixed; left:0; right:0; bottom:0; margin:0; padding:10px 16px calc(10px + env(safe-area-inset-bottom));
+    direction:ltr; text-align:left; font:12px/1.5 ui-monospace,Menlo,monospace; color:var(--sub);
+    background:rgba(0,0,0,.35); white-space:pre-wrap; }
 </style>
 </head>
 <body>
@@ -38,6 +41,7 @@
   <div id="name" class="q">באיזו תחנה אני?</div>
   <div id="note">לחץ כדי לבדוק</div>
 </button>
+<pre id="dbg" hidden></pre>
 <script src="stations.js"></script>
 <script src="tracks.js"></script>
 <script>
@@ -49,6 +53,12 @@
   var kicker = document.getElementById('kicker');
   var nameEl = document.getElementById('name');
   var note = document.getElementById('note');
+  var dbg = document.getElementById('dbg');
+  // ?debug מציג קואורדינטות ודיוק; ?lat=..&lon=.. מחליף את ה-GPS במיקום מדומה (לבדיקות)
+  var Q = new URLSearchParams(location.search);
+  var DEBUG = Q.has('debug') || Q.has('lat');
+  var FAKE = Q.has('lat') && Q.has('lon') ? [parseFloat(Q.get('lat')), parseFloat(Q.get('lon'))] : null;
+  if (FAKE && (isNaN(FAKE[0]) || isNaN(FAKE[1]))) FAKE = null;
 
   function dist(lat1, lon1, lat2, lon2) {
     var R = 6371000, r = Math.PI / 180;
@@ -130,20 +140,36 @@
       show({ name: 'אין גישה ל-GPS', q: true, note: 'המכשיר לא תומך במיקום' });
       return;
     }
-    navigator.geolocation.getCurrentPosition(function (pos) {
-      btn.classList.remove('busy');
-      var r = describe(pos.coords.latitude, pos.coords.longitude);
-      var acc = Math.round(pos.coords.accuracy);
-      r.note = acc > 500 ? 'דיוק נמוך (±' + acc + ' מ׳), נסה שוב ליד החלון' :
-               r.far ? fmtDist(r.d) + ' ממך · לחץ לרענון' : 'לחץ לרענון';
-      show(r);
-    }, function (err) {
+    if (FAKE) { onPos({ coords: { latitude: FAKE[0], longitude: FAKE[1], accuracy: 5 }, timestamp: Date.now() }); return; }
+    navigator.geolocation.getCurrentPosition(onPos, function (err) {
       btn.classList.remove('busy');
       var msg = err.code === 1 ? 'צריך לאשר גישה למיקום' :
                 err.code === 3 ? 'לא הצלחתי לקבל מיקום, נסה שוב' : 'המיקום לא זמין כרגע';
       var hint = err.code === 1 ? 'הגדרות › Safari › מיקום › אפשר' : 'לחץ לנסות שוב';
       show({ name: msg, q: true, note: hint });
-    }, { enableHighAccuracy: true, timeout: 20000, maximumAge: 3000 });
+      debug('error ' + err.code + ': ' + err.message);
+    }, { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 });
+  }
+
+  function onPos(pos) {
+    btn.classList.remove('busy');
+    var lat = pos.coords.latitude, lon = pos.coords.longitude;
+    var r = describe(lat, lon);
+    var acc = Math.round(pos.coords.accuracy);
+    var accTxt = 'דיוק ±' + acc + ' מ׳';
+    r.note = acc > 500 ? 'דיוק נמוך (±' + acc + ' מ׳), נסה שוב ליד החלון' :
+             r.far ? fmtDist(r.d) + ' ממך · ' + accTxt : accTxt + ' · לחץ לרענון';
+    show(r);
+    var near = stationsByDistance(lat, lon).slice(0, 3).map(function (s) { return s.n + '  ' + Math.round(s.d) + ' m'; });
+    debug('lat ' + lat.toFixed(5) + '\nlon ' + lon.toFixed(5) + '\naccuracy ' + acc + ' m' +
+          '\nfix age ' + Math.round((Date.now() - pos.timestamp) / 1000) + ' s' +
+          (FAKE ? '\n(simulated via ?lat&lon)' : '') + '\n' + near.join('\n'));
+  }
+
+  function debug(text) {
+    if (!DEBUG) return;
+    dbg.hidden = false;
+    dbg.textContent = text;
   }
 
   btn.addEventListener('click', locate);
