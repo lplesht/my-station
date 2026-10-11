@@ -252,6 +252,7 @@ OVERPASS_QUERY = ('[out:json][timeout:240];way["railway"="rail"](29.3,34.2,33.5,
 EXCLUDED_SERVICE = ("yard", "siding", "spur")
 OSM_TOL_M = 200          # distance from an OSM track that counts as "on the railway"
 SNAP_MAX_M = 300         # track segments this close to a station can start/end its routes
+OFFSET_WEIGHT = 4        # station->track distance counts this many times in a route's cost (see near_segments)
 MAX_DETOUR = 1.8         # a routed path longer than this x the straight line is not trusted
 MIN_COMPONENT = 200      # ignore disconnected scraps of track smaller than this (nodes)
 
@@ -345,7 +346,10 @@ def near_segments(lat, lon, nodes, edges):
     point on a *segment* is exact. A station may sit between parallel tracks that only join further
     away, so every segment within SNAP_MAX_M is a candidate.
     Returns {graph node: (cost m, point)}: entering the graph at that node costs the walk station ->
-    projection -> node, and the route polyline starts at the projection point."""
+    projection -> node, and the route polyline starts at the projection point. The station->track
+    offset is weighted: otherwise the neighbouring segment's end node (offset = its straight-line
+    distance, no walk) can undercut the true projection when segments are long, and routes would start
+    hundreds of metres from the station."""
     k = math.cos(lat * math.pi / 180)
     kx, ky = 111320 * k, 110540
     out = {}
@@ -363,7 +367,7 @@ def near_segments(lat, lon, nodes, edges):
             continue
         point = (lat + py / ky, lon + px / kx)
         for n, nx, ny in ((u, ax, ay), (v, bx, by)):
-            cost = off + math.hypot(nx - px, ny - py)
+            cost = OFFSET_WEIGHT * off + math.hypot(nx - px, ny - py)
             if n not in out or cost < out[n][0]:
                 out[n] = (cost, point)
     return out
@@ -395,7 +399,27 @@ def route(adj, nodes, srcs, dsts):
         path.append(prev[path[-1]])
     path.reverse()
     line = [srcs[path[0]][1]] + [nodes[n] for n in path] + [dsts[end][1]]
+    line = trim_backtrack(line)
     return line, sum(dist(*p, *q) for p, q in zip(line, line[1:]))
+
+
+def on_segment(pt, a, b, tol=3.0):
+    lat0 = pt[0]
+    (x, y), (ax, ay), (bx, by) = to_xy(*pt, lat0), to_xy(*a, lat0), to_xy(*b, lat0)
+    dx, dy = bx - ax, by - ay
+    L2 = dx * dx + dy * dy
+    t = ((x - ax) * dx + (y - ay) * dy) / L2 if L2 else 0.0
+    return 0 <= t <= 1 and math.hypot(ax + dx * t - x, ay + dy * t - y) <= tol
+
+
+def trim_backtrack(line):
+    """The route starts at the station's projection p on segment u-v but may enter the graph at u, behind
+    p, then continue through v. Drop u (and the same at the far end) so the line does not step back."""
+    if len(line) > 3 and on_segment(line[0], line[1], line[2]):
+        line = line[1:]
+    if len(line) > 3 and on_segment(line[-1], line[-3], line[-2]):
+        line = line[:-2] + line[-1:]
+    return line
 
 
 def osm_tracks(pairs, stations, osm):
