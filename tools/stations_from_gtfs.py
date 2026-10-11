@@ -246,12 +246,14 @@ def chord_track(a, b, stations):
 OVERPASS_URLS = ["https://overpass-api.de/api/interpreter",
                  "https://overpass.kumi.systems/api/interpreter",
                  "https://overpass.private.coffee/api/interpreter"]
-# main rail lines only: no yards/sidings/spurs, no industrial or military branches
+# main rail lines and the crossovers that join parallel tracks; no yards/sidings/spurs,
+# no industrial or military branches
 OVERPASS_QUERY = ('[out:json][timeout:240];'
-                  'way["railway"="rail"]["service"!~"."]["usage"!~"industrial|military"]'
+                  'way["railway"="rail"]["service"!~"^(yard|siding|spur)$"]["usage"!~"industrial|military"]'
                   '(29.3,34.2,33.5,35.95);out geom;')
+EXCLUDED_SERVICE = ("yard", "siding", "spur")
 OSM_TOL_M = 200          # distance from an OSM track that counts as "on the railway"
-SNAP_MAX_M = 400         # a station must have OSM track this close
+SNAP_MAX_M = 300         # OSM track nodes this close to a station can start/end its routes
 MAX_DETOUR = 1.8         # a routed path longer than this x the straight line is not trusted
 MIN_COMPONENT = 200      # ignore disconnected scraps of track smaller than this (nodes)
 
@@ -279,7 +281,8 @@ def osm_graph(osm):
         if el.get("type") != "way" or not el.get("geometry") or any(g is None for g in el["geometry"]):
             continue
         tags = el.get("tags", {})
-        if tags.get("railway") != "rail" or "service" in tags or tags.get("usage") in ("industrial", "military"):
+        if tags.get("railway") != "rail" or tags.get("service") in EXCLUDED_SERVICE \
+                or tags.get("usage") in ("industrial", "military"):
             continue   # same filter as the query, in case the file came from elsewhere
         ways += 1
         ids = el["nodes"]
@@ -311,53 +314,61 @@ def osm_graph(osm):
     return nodes, adj
 
 
-def snap(lat, lon, nodes):
-    best, bd = None, SNAP_MAX_M
+def near_nodes(lat, lon, nodes):
+    """All track nodes within SNAP_MAX_M of a point, with their distance. A station can sit between
+    several parallel tracks that only join further away, so we start routes from all of them."""
     k = math.cos(lat * math.pi / 180)
+    out = {}
     for nid, (a, b) in nodes.items():
-        if abs(a - lat) > 0.01 or abs(b - lon) > 0.012:   # cheap pre-filter (~1 km)
+        if abs(a - lat) > 0.004 or abs(b - lon) > 0.005:   # cheap pre-filter (~450 m)
             continue
         d = math.hypot((a - lat) * 110540, (b - lon) * 111320 * k)
-        if d < bd:
-            best, bd = nid, d
-    return best, bd
+        if d <= SNAP_MAX_M:
+            out[nid] = d
+    return out
 
 
-def route(adj, src, dst):
-    best, prev, heap = {src: 0.0}, {}, [(0.0, src)]
+def route(adj, nodes, srcs, dsts):
+    """Shortest path from any node of srcs to any node of dsts; the entry/exit distances count too."""
+    best, prev, heap = dict(srcs), {}, [(d, n) for n, d in srcs.items()]
+    heapq.heapify(heap)
+    total, end = float("inf"), None
     while heap:
         d, u = heapq.heappop(heap)
-        if u == dst:
-            path = [u]
-            while path[-1] != src:
-                path.append(prev[path[-1]])
-            return path[::-1], d
+        if d > total:
+            break
         if d > best[u]:
             continue
+        if u in dsts and d + dsts[u] < total:
+            total, end = d + dsts[u], u
         for v, w in adj[u]:
             if d + w < best.get(v, float("inf")):
                 best[v] = d + w
                 prev[v] = u
                 heapq.heappush(heap, (d + w, v))
-    return None, None
+    if end is None:
+        return None, None
+    path = [end]
+    while path[-1] in prev:
+        path.append(prev[path[-1]])
+    path.reverse()
+    length = sum(dist(*nodes[u], *nodes[v]) for u, v in zip(path, path[1:]))
+    return path, length
 
 
 def osm_tracks(pairs, stations, osm):
     nodes, adj = osm_graph(osm)
-    snapped = {}
-    for i, (name, lat, lon) in enumerate(stations):
-        snapped[i] = snap(lat, lon, nodes)
-    far = [(stations[i][0], round(d)) for i, (n, d) in snapped.items() if n is not None and d > 150]
-    missing = [stations[i][0] for i, (n, d) in snapped.items() if n is None]
-    print(f"[osm] stations snapped >150 m from track: {far}")
-    print(f"[osm] stations with NO track within {SNAP_MAX_M} m: {missing}")
+    near = {i: near_nodes(lat, lon, nodes) for i, (_, lat, lon) in enumerate(stations)}
+    lonely = [stations[i][0] for i, nn in near.items() if not nn]
+    print(f"[osm] stations with NO track node within {SNAP_MAX_M} m: {lonely}")
     tracks, fallbacks, ratios = [], [], []
     for a, b in pairs:
-        (na, _), (nb, _) = snapped[a], snapped[b]
         chord = dist(stations[a][1], stations[a][2], stations[b][1], stations[b][2])
-        path, length = route(adj, na, nb) if na is not None and nb is not None else (None, None)
+        path, length = route(adj, nodes, near[a], near[b]) if near[a] and near[b] else (None, None)
         if path is None or length > MAX_DETOUR * chord:
-            fallbacks.append((stations[a][0], stations[b][0], "no path" if path is None else f"path {length / 1000:.1f} km vs chord {chord / 1000:.1f} km"))
+            fallbacks.append((stations[a][0], stations[b][0],
+                              "no path" if path is None else f"path {length / 1000:.1f} km vs chord {chord / 1000:.1f} km",
+                              f"{len(near[a])}/{len(near[b])} start/end nodes"))
             tracks.append(chord_track(a, b, stations))
             continue
         ratios.append((length / chord, stations[a][0], stations[b][0]))
