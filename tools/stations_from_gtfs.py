@@ -253,7 +253,7 @@ OVERPASS_QUERY = ('[out:json][timeout:240];'
                   '(29.3,34.2,33.5,35.95);out geom;')
 EXCLUDED_SERVICE = ("yard", "siding", "spur")
 OSM_TOL_M = 200          # distance from an OSM track that counts as "on the railway"
-SNAP_MAX_M = 300         # OSM track nodes this close to a station can start/end its routes
+SNAP_MAX_M = 300         # track segments this close to a station can start/end its routes
 MAX_DETOUR = 1.8         # a routed path longer than this x the straight line is not trusted
 MIN_COMPONENT = 200      # ignore disconnected scraps of track smaller than this (nodes)
 
@@ -276,7 +276,7 @@ def fetch_osm():
 
 
 def osm_graph(osm):
-    nodes, adj, ways = {}, {}, 0
+    nodes, adj, ways, edges = {}, {}, 0, []
     for el in osm.get("elements", []):
         if el.get("type") != "way" or not el.get("geometry") or any(g is None for g in el["geometry"]):
             continue
@@ -292,6 +292,7 @@ def osm_graph(osm):
             w = dist(*nodes[u], *nodes[v])
             adj.setdefault(u, []).append((v, w))
             adj.setdefault(v, []).append((u, w))
+            edges.append((u, v))
     # keep only the big connected components: stray fragments would trap a station snap
     seen, keep = set(), set()
     for start in adj:
@@ -310,27 +311,45 @@ def osm_graph(osm):
             keep.update(comp)
     nodes = {n: c for n, c in nodes.items() if n in keep}
     adj = {u: [(v, w) for v, w in es if v in keep] for u, es in adj.items() if u in keep}
-    print(f"[osm] {ways} ways, {len(nodes)} track nodes in main network")
-    return nodes, adj
+    edges = [(u, v) for u, v in edges if u in keep and v in keep]
+    print(f"[osm] {ways} ways, {len(nodes)} track nodes, {len(edges)} segments in main network")
+    return nodes, adj, edges
 
 
-def near_nodes(lat, lon, nodes):
-    """All track nodes within SNAP_MAX_M of a point, with their distance. A station can sit between
-    several parallel tracks that only join further away, so we start routes from all of them."""
+def near_segments(lat, lon, nodes, edges):
+    """Where a station projects onto nearby track segments. OSM ways have sparse vertices on straight
+    track, so snapping to the nearest *node* can be hundreds of metres off; snapping to the nearest
+    point on a *segment* is exact. A station may sit between parallel tracks that only join further
+    away, so every segment within SNAP_MAX_M is a candidate.
+    Returns {graph node: (cost m, point)}: entering the graph at that node costs the walk station ->
+    projection -> node, and the route polyline starts at the projection point."""
     k = math.cos(lat * math.pi / 180)
+    kx, ky = 111320 * k, 110540
     out = {}
-    for nid, (a, b) in nodes.items():
-        if abs(a - lat) > 0.004 or abs(b - lon) > 0.005:   # cheap pre-filter (~450 m)
+    for u, v in edges:
+        (ua, ub), (va, vb) = nodes[u], nodes[v]
+        if not (min(ua, va) - 0.003 <= lat <= max(ua, va) + 0.003 and min(ub, vb) - 0.004 <= lon <= max(ub, vb) + 0.004):
             continue
-        d = math.hypot((a - lat) * 110540, (b - lon) * 111320 * k)
-        if d <= SNAP_MAX_M:
-            out[nid] = d
+        ax, ay, bx, by = (ub - lon) * kx, (ua - lat) * ky, (vb - lon) * kx, (va - lat) * ky
+        dx, dy = bx - ax, by - ay
+        L2 = dx * dx + dy * dy
+        t = max(0.0, min(1.0, -(ax * dx + ay * dy) / L2)) if L2 else 0.0
+        px, py = ax + dx * t, ay + dy * t
+        off = math.hypot(px, py)
+        if off > SNAP_MAX_M:
+            continue
+        point = (lat + py / ky, lon + px / kx)
+        for n, nx, ny in ((u, ax, ay), (v, bx, by)):
+            cost = off + math.hypot(nx - px, ny - py)
+            if n not in out or cost < out[n][0]:
+                out[n] = (cost, point)
     return out
 
 
 def route(adj, nodes, srcs, dsts):
-    """Shortest path from any node of srcs to any node of dsts; the entry/exit distances count too."""
-    best, prev, heap = dict(srcs), {}, [(d, n) for n, d in srcs.items()]
+    """Cheapest path from the graph entry nodes of one station to those of another.
+    srcs/dsts: {node: (entry cost, projection point)}. Returns the polyline and its length."""
+    best, prev, heap = {n: c for n, (c, _) in srcs.items()}, {}, [(c, n) for n, (c, _) in srcs.items()]
     heapq.heapify(heap)
     total, end = float("inf"), None
     while heap:
@@ -339,8 +358,8 @@ def route(adj, nodes, srcs, dsts):
             break
         if d > best[u]:
             continue
-        if u in dsts and d + dsts[u] < total:
-            total, end = d + dsts[u], u
+        if u in dsts and d + dsts[u][0] < total:
+            total, end = d + dsts[u][0], u
         for v, w in adj[u]:
             if d + w < best.get(v, float("inf")):
                 best[v] = d + w
@@ -352,27 +371,30 @@ def route(adj, nodes, srcs, dsts):
     while path[-1] in prev:
         path.append(prev[path[-1]])
     path.reverse()
-    length = sum(dist(*nodes[u], *nodes[v]) for u, v in zip(path, path[1:]))
-    return path, length
+    line = [srcs[path[0]][1]] + [nodes[n] for n in path] + [dsts[end][1]]
+    return line, sum(dist(*p, *q) for p, q in zip(line, line[1:]))
 
 
 def osm_tracks(pairs, stations, osm):
-    nodes, adj = osm_graph(osm)
-    near = {i: near_nodes(lat, lon, nodes) for i, (_, lat, lon) in enumerate(stations)}
+    nodes, adj, edges = osm_graph(osm)
+    near = {i: near_segments(lat, lon, nodes, edges) for i, (_, lat, lon) in enumerate(stations)}
     lonely = [stations[i][0] for i, nn in near.items() if not nn]
-    print(f"[osm] stations with NO track node within {SNAP_MAX_M} m: {lonely}")
+    closest = sorted((min(dist(stations[i][1], stations[i][2], *pt) for _, pt in nn.values()), stations[i][0])
+                     for i, nn in near.items() if nn)[-5:]
+    print(f"[osm] stations with NO track segment within {SNAP_MAX_M} m: {lonely}")
+    print(f"[osm] stations furthest from any track segment (m): {[(n, round(d)) for d, n in closest]}")
     tracks, fallbacks, ratios = [], [], []
     for a, b in pairs:
         chord = dist(stations[a][1], stations[a][2], stations[b][1], stations[b][2])
-        path, length = route(adj, nodes, near[a], near[b]) if near[a] and near[b] else (None, None)
-        if path is None or length > MAX_DETOUR * chord:
+        line, length = route(adj, nodes, near[a], near[b]) if near[a] and near[b] else (None, None)
+        if line is None or length > MAX_DETOUR * chord:
             fallbacks.append((stations[a][0], stations[b][0],
-                              "no path" if path is None else f"path {length / 1000:.1f} km vs chord {chord / 1000:.1f} km",
-                              f"{len(near[a])}/{len(near[b])} start/end nodes"))
+                              "no path" if line is None else f"path {length / 1000:.1f} km vs chord {chord / 1000:.1f} km",
+                              f"{len(near[a])}/{len(near[b])} start/end entries"))
             tracks.append(chord_track(a, b, stations))
             continue
         ratios.append((length / chord, stations[a][0], stations[b][0]))
-        line = simplify([nodes[n] for n in path], SIMPLIFY_M)
+        line = simplify(line, SIMPLIFY_M)
         tracks.append((line, [(0, a), (len(line) - 1, b)], OSM_TOL_M))
     ratios.sort(reverse=True)
     print(f"[osm] routed {len(ratios)} of {len(pairs)} segments along real track, {len(fallbacks)} fell back to a straight chord")
