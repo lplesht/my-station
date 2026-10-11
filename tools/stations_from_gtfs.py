@@ -14,6 +14,7 @@ be named after a station are not included.
 """
 import argparse
 import csv
+import heapq
 import io
 import json
 import math
@@ -208,6 +209,42 @@ CHORD_TOL_M = 500    # straight chords between stations only approximate the rea
 SKIP_NEAR_M = 400    # drop A-C when a station B lies on the chord A-C (an express service skipping B)
 
 
+DETOUR_RATIO = 1.5   # drop A-C when the rest of the network connects A to C within 1.5x of the chord
+
+
+def prune_detours(edges, stations):
+    """Drop segments that skip stations: fast trains link far-apart stations directly, but the
+    track really passes through the stations in between. Longest segments are tested first."""
+    def length(a, b):
+        return dist(stations[a][1], stations[a][2], stations[b][1], stations[b][2])
+
+    def shortest(es, a, b):
+        adj = {}
+        for x, y in es:
+            w = length(x, y)
+            adj.setdefault(x, []).append((y, w))
+            adj.setdefault(y, []).append((x, w))
+        best, heap = {a: 0}, [(0, a)]
+        while heap:
+            d, u = heapq.heappop(heap)
+            if u == b:
+                return d
+            if d > best[u]:
+                continue
+            for v, w in adj.get(u, []):
+                if d + w < best.get(v, float("inf")):
+                    best[v] = d + w
+                    heapq.heappush(heap, (d + w, v))
+        return None
+
+    for a, b in sorted(edges, key=lambda e: -length(*e)):
+        rest = edges - {(a, b)}
+        d = shortest(rest, a, b)
+        if d is not None and d <= DETOUR_RATIO * length(a, b):
+            edges = rest
+    return sorted(edges)
+
+
 def build_adjacency_tracks(pairs, stations):
     """One straight segment per pair of stations that follow each other on a train service."""
     index = {n: i for i, (n, _, _) in enumerate(stations)}
@@ -226,6 +263,7 @@ def build_adjacency_tracks(pairs, stations):
 
     kept = [(a, b) for a, b in segs
             if not any(c not in (a, b) and on_chord(a, b, c) for c in range(len(stations)))]
+    kept = prune_detours(set(kept), stations)
     tracks = []
     for a, b in kept:
         line = [(stations[a][1], stations[a][2]), (stations[b][1], stations[b][2])]
