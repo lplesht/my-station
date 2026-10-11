@@ -248,9 +248,7 @@ OVERPASS_URLS = ["https://overpass-api.de/api/interpreter",
                  "https://overpass.private.coffee/api/interpreter"]
 # main rail lines and the crossovers that join parallel tracks; no yards/sidings/spurs,
 # no industrial or military branches
-OVERPASS_QUERY = ('[out:json][timeout:240];'
-                  'way["railway"="rail"]["service"!~"^(yard|siding|spur)$"]["usage"!~"industrial|military"]'
-                  '(29.3,34.2,33.5,35.95);out geom;')
+OVERPASS_QUERY = ('[out:json][timeout:240];way["railway"="rail"](29.3,34.2,33.5,35.95);out geom;')
 EXCLUDED_SERVICE = ("yard", "siding", "spur")
 OSM_TOL_M = 200          # distance from an OSM track that counts as "on the railway"
 SNAP_MAX_M = 300         # track segments this close to a station can start/end its routes
@@ -275,15 +273,40 @@ def fetch_osm():
     sys.exit(f"OpenStreetMap download failed on every server: {last_err}")
 
 
+def way_excluded(tags):
+    return tags.get("railway") != "rail" or tags.get("service") in EXCLUDED_SERVICE \
+        or tags.get("usage") in ("industrial", "military")
+
+
+def diagnose_osm(osm, stations, names=("אשקלון", "רחובות", "לוד", "השלום", "יבנה מזרח", "באר שבע מרכז")):
+    """For a few stations: which OSM rail ways pass nearby, and are they kept or filtered out?"""
+    ways = [e for e in osm.get("elements", []) if e.get("type") == "way" and e.get("geometry")]
+    from collections import Counter
+    print("[osm] tag census: service =", dict(Counter(e.get("tags", {}).get("service", "-") for e in ways)),
+          "| usage =", dict(Counter(e.get("tags", {}).get("usage", "-") for e in ways)))
+    for name, lat, lon in stations:
+        if name not in names:
+            continue
+        k = math.cos(lat * math.pi / 180)
+        near = []
+        for e in ways:
+            g = [x for x in e["geometry"] if x]
+            d = min((math.hypot((x["lat"] - lat) * 110540, (x["lon"] - lon) * 111320 * k) for x in g), default=1e9)
+            if d < 600:
+                t = e.get("tags", {})
+                near.append((round(d), e["id"], len(g), "KEPT" if not way_excluded(t) else "excluded",
+                             {kk: t[kk] for kk in ("service", "usage", "tunnel", "bridge", "construction", "railway:traffic_mode") if kk in t}))
+        near.sort()
+        print(f"[osm] near {name}: {len(near)} ways within 600 m (distance to nearest vertex): {near[:8]}")
+
+
 def osm_graph(osm):
     nodes, adj, ways, edges = {}, {}, 0, []
     for el in osm.get("elements", []):
         if el.get("type") != "way" or not el.get("geometry") or any(g is None for g in el["geometry"]):
             continue
-        tags = el.get("tags", {})
-        if tags.get("railway") != "rail" or tags.get("service") in EXCLUDED_SERVICE \
-                or tags.get("usage") in ("industrial", "military"):
-            continue   # same filter as the query, in case the file came from elsewhere
+        if way_excluded(el.get("tags", {})):
+            continue   # yards, sidings, spurs, industrial/military branches
         ways += 1
         ids = el["nodes"]
         for nid, g in zip(ids, el["geometry"]):
@@ -376,6 +399,7 @@ def route(adj, nodes, srcs, dsts):
 
 
 def osm_tracks(pairs, stations, osm):
+    diagnose_osm(osm, stations)
     nodes, adj, edges = osm_graph(osm)
     near = {i: near_segments(lat, lon, nodes, edges) for i, (_, lat, lon) in enumerate(stations)}
     lonely = [stations[i][0] for i, nn in near.items() if not nn]
