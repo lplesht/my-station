@@ -83,10 +83,11 @@ def rail_stations(zip_path):
         print(f"[diag] rail trips with a shape_id: {len(shape_ids)}  e.g. {sorted(shape_ids)[:3]}")
         print(f"[diag] shapes.txt rows: {shape_rows}  columns: {shape_cols}  first ids: {shape_sample}")
         print(f"[diag] rail shapes matched: {len(shapes)}")
-        stop_ids = set()
+        stop_ids, trip_stops = set(), {}
         for st in rows(zf, "stop_times.txt"):  # large file: streamed, not loaded
             if st["trip_id"] in trips:
                 stop_ids.add(st["stop_id"])
+                trip_stops.setdefault(st["trip_id"], []).append((int(float(st["stop_sequence"])), st["stop_id"]))
         stops = {s["stop_id"]: s for s in rows(zf, "stops.txt")}
         feed_date = ""
         if "feed_info.txt" in names:
@@ -114,7 +115,23 @@ def rail_stations(zip_path):
         lon = sum(float(s["stop_lon"]) for s in group) / len(group)
         out.append((name, round(lat, 5), round(lon, 5)))
     out.sort(key=lambda s: -s[1])  # north to south
-    return out, shapes, feed_date
+
+    # which stations follow each other on real train services (official data, no geometry needed)
+    name_of = {}
+    for sid in stop_ids:
+        s = stops.get(sid)
+        if s:
+            parent = s.get("parent_station") or ""
+            name_of[sid] = clean_name((stops[parent] if parent in stops else s)["stop_name"])
+    pairs = set()
+    for seq in trip_stops.values():
+        names_in_order = []
+        for _, sid in sorted(seq):
+            n = name_of.get(sid)
+            if n and (not names_in_order or names_in_order[-1] != n):
+                names_in_order.append(n)
+        pairs.update(tuple(sorted(p)) for p in zip(names_in_order, names_in_order[1:]))
+    return out, shapes, pairs, feed_date
 
 
 # --- tracks: rail shapes, simplified and de-duplicated -----------------------
@@ -187,12 +204,41 @@ def build_tracks(shapes, stations):
     return tracks
 
 
-def write_tracks_js(path, tracks, feed_date):
+CHORD_TOL_M = 500    # straight chords between stations only approximate the real track
+SKIP_NEAR_M = 400    # drop A-C when a station B lies on the chord A-C (an express service skipping B)
+
+
+def build_adjacency_tracks(pairs, stations):
+    """One straight segment per pair of stations that follow each other on a train service."""
+    index = {n: i for i, (n, _, _) in enumerate(stations)}
+    segs = [tuple(sorted((index[a], index[b]))) for a, b in pairs if a in index and b in index and a != b]  # north first
+
+    def on_chord(a, b, c):
+        la, lo, lb, lob = stations[a][1], stations[a][2], stations[b][1], stations[b][2]
+        lat0 = (la + lb) / 2
+        ax, ay = to_xy(la, lo, lat0)
+        bx, by = to_xy(lb, lob, lat0)
+        cx, cy = to_xy(stations[c][1], stations[c][2], lat0)
+        dx, dy = bx - ax, by - ay
+        L2 = dx * dx + dy * dy or 1e-9
+        t = ((cx - ax) * dx + (cy - ay) * dy) / L2
+        return 0.05 < t < 0.95 and math.hypot(ax + dx * t - cx, ay + dy * t - cy) < SKIP_NEAR_M
+
+    kept = [(a, b) for a, b in segs
+            if not any(c not in (a, b) and on_chord(a, b, c) for c in range(len(stations)))]
+    tracks = []
+    for a, b in kept:
+        line = [(stations[a][1], stations[a][2]), (stations[b][1], stations[b][2])]
+        tracks.append((line, [(0, a), (1, b)]))
+    return tracks, len(segs) - len(kept)
+
+
+def write_tracks_js(path, tracks, feed_date, tol, source):
     lines = [
-        "// מסלולי המסילה מתוך shapes.txt של ה-GTFS הרשמי"
-        + (f" (גרסה {feed_date})" if feed_date else "") + ", מפושטים לדיוק ~15 מ׳.",
+        f"// {source}" + (f" (גרסה {feed_date})" if feed_date else "") + ".",
         "// p: קו רוחב/אורך לסירוגין. s: [אינדקס נקודה במסלול, אינדקס תחנה ב-STATIONS].",
         "// נוצר אוטומטית: python3 tools/stations_from_gtfs.py --download",
+        f"const TRACKS_TOL = {tol};  // עד כמה מטרים מהמסלול נחשבים \"על המסילה\"",
         "const TRACKS = [",
     ]
     for line, stops in tracks:
@@ -267,18 +313,28 @@ def main():
     if not zip_path:
         p.error("give a GTFS zip path or --download")
 
-    new, shapes, feed_date = rail_stations(zip_path)
+    new, shapes, pairs, feed_date = rail_stations(zip_path)
     out = Path(a.out)
     report(read_current(out) if out.exists() else [], new)
-    tracks = build_tracks(shapes, new)
-    print(f"\nTracks: {len(shapes)} rail shapes in feed, {len(tracks)} kept after de-duplication, "
-          f"{sum(len(t[0]) for t in tracks)} points")
+    if shapes:
+        tracks = build_tracks(shapes, new)
+        tol, source = 250, "מסלולי המסילה מתוך shapes.txt של ה-GTFS הרשמי, מפושטים לדיוק ~15 מ׳"
+        print(f"\nTracks: {len(shapes)} rail shapes in feed, {len(tracks)} kept after de-duplication, "
+              f"{sum(len(t[0]) for t in tracks)} points")
+    else:
+        tracks, skipped = build_adjacency_tracks(pairs, new)
+        tol, source = CHORD_TOL_M, ("ה-GTFS הרשמי לא כולל מסלולי מסילה (shapes). כאן: קו ישר בין כל שתי תחנות "
+                                    "עוקבות בשירות רכבת אמיתי, מתוך stop_times")
+        print(f"\nNo shapes in feed: {len(pairs)} adjacent station pairs from stop_times, "
+              f"{skipped} skip-stop pairs dropped, {len(tracks)} segments kept")
+        for t in tracks:
+            print("  ", new[t[1][0][1]][0], "-", new[t[1][1][1]][0])
     if not a.dry_run:
         write_js(out, new, feed_date)
         print(f"Wrote {len(new)} stations to {out}")
         if tracks:
             tracks_out = out.with_name("tracks.js")
-            write_tracks_js(tracks_out, tracks, feed_date)
+            write_tracks_js(tracks_out, tracks, feed_date, tol, source)
             print(f"Wrote tracks to {tracks_out}")
 
 

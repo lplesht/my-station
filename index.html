@@ -47,7 +47,7 @@
 <script>
 (function () {
   var NEAR_M = 1000;          // עד המרחק הזה מציגים "תחנה X"
-  var ON_TRACK_M = 300;       // עד המרחק הזה מהמסילה נחשבים "בדרך, בין X ל-Y"
+  var ON_TRACK_M = 300;       // ברירת מחדל; tracks.js יכול לקבוע TRACKS_TOL משלו
   var LINE_M = 700;           // בלי נתוני מסילה: מרחק מותר מהקו הישר בין שתי תחנות
   var btn = document.getElementById('btn');
   var kicker = document.getElementById('kicker');
@@ -95,7 +95,8 @@
         if (!best || r.d < best.d) best = { d: r.d, tr: tr, seg: k / 2 };
       }
     });
-    if (!best || best.d > ON_TRACK_M) return null;
+    var tol = typeof TRACKS_TOL !== 'undefined' ? TRACKS_TOL : ON_TRACK_M;
+    if (!best || best.d > tol) return null;
     var prev = null, next = null;
     best.tr.s.forEach(function (st) {
       if (st[0] <= best.seg) prev = st[1];
