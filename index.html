@@ -133,51 +133,80 @@
     note.textContent = o.note || '';
   }
 
-  function locate() {
-    btn.classList.add('busy');
-    show({ kicker: '', name: 'מחפש מיקום…', q: true, note: '' });
-    if (!navigator.geolocation) {
-      btn.classList.remove('busy');
-      show({ name: 'אין גישה ל-GPS', q: true, note: 'המכשיר לא תומך במיקום' });
-      return;
-    }
-    if (FAKE) { onPos({ coords: { latitude: FAKE[0], longitude: FAKE[1], accuracy: 5 }, timestamp: Date.now() }); return; }
-    navigator.geolocation.getCurrentPosition(onPos, function (err) {
-      btn.classList.remove('busy');
-      var msg = err.code === 1 ? 'צריך לאשר גישה למיקום' :
-                err.code === 3 ? 'לא הצלחתי לקבל מיקום, נסה שוב' : 'המיקום לא זמין כרגע';
-      var hint = err.code === 1 ? 'הגדרות › Safari › מיקום › אפשר' : 'לחץ לנסות שוב';
-      show({ name: msg, q: true, note: hint });
-      debug('error ' + err.code + ': ' + err.message);
-    }, { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 });
-  }
-
-  function onPos(pos) {
-    btn.classList.remove('busy');
-    var lat = pos.coords.latitude, lon = pos.coords.longitude;
-    var r = describe(lat, lon);
-    var acc = Math.round(pos.coords.accuracy);
-    var accTxt = 'דיוק ±' + acc + ' מ׳';
-    r.note = acc > 500 ? 'דיוק נמוך (±' + acc + ' מ׳), נסה שוב ליד החלון' :
-             r.far ? fmtDist(r.d) + ' ממך · ' + accTxt : accTxt + ' · לחץ לרענון';
-    show(r);
-    var near = stationsByDistance(lat, lon).slice(0, 3).map(function (s) { return s.n + '  ' + Math.round(s.d) + ' m'; });
-    debug('lat ' + lat.toFixed(5) + '\nlon ' + lon.toFixed(5) + '\naccuracy ' + acc + ' m' +
-          '\nfix age ' + Math.round((Date.now() - pos.timestamp) / 1000) + ' s' +
-          (FAKE ? '\n(simulated via ?lat&lon)' : '') + '\n' + near.join('\n'));
-  }
-
   function debug(text) {
     if (!DEBUG) return;
     dbg.hidden = false;
     dbg.textContent = text;
   }
 
-  btn.addEventListener('click', locate);
-  document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) locate();
-  });
-  locate();
+  var STALE_MS = 45000;      // בלי עדכון מיקום מעבר לזה: מציינים שהתוצאה ישנה
+  var watchId = null, last = null, fixes = 0;
+
+  function clock(t) {
+    var d = new Date(t), p = function (n) { return (n < 10 ? '0' : '') + n; };
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
+  // שורת ההערה מתחת לשם: מרחק, דיוק ה-GPS ושעת העדכון האחרון; ואם המיקום לא מתעדכן, אזהרה
+  function noteText() {
+    if (Date.now() - last.at > STALE_MS) return 'אין עדכון מיקום מאז ' + clock(last.at) + ' · לחץ לרענון';
+    if (last.acc > 500) return 'דיוק נמוך (±' + last.acc + ' מ׳), נסה שוב ליד החלון';
+    return (last.r.far ? fmtDist(last.r.d) + ' ממך · ' : '') + 'דיוק GPS ±' + last.acc + ' מ׳ · ' + clock(last.at);
+  }
+
+  function onPos(pos) {
+    btn.classList.remove('busy');
+    fixes++;
+    var lat = pos.coords.latitude, lon = pos.coords.longitude;
+    last = { r: describe(lat, lon), acc: Math.round(pos.coords.accuracy), at: Date.now() };
+    last.r.note = noteText();
+    show(last.r);
+    var near = stationsByDistance(lat, lon).slice(0, 3).map(function (s) { return s.n + '  ' + Math.round(s.d) + ' m'; });
+    debug('lat ' + lat.toFixed(5) + '\nlon ' + lon.toFixed(5) + '\naccuracy ' + last.acc + ' m' +
+          '\nfix #' + fixes + ' at ' + clock(last.at) + ', gps time ' + clock(pos.timestamp) +
+          (FAKE ? '\n(simulated via ?lat&lon)' : '') + '\n' + near.join('\n'));
+  }
+
+  function onErr(err) {
+    btn.classList.remove('busy');
+    debug('error ' + err.code + ': ' + err.message);
+    if (err.code === 1) {
+      stop();
+      show({ name: 'צריך לאשר גישה למיקום', q: true, note: 'הגדרות › Safari › מיקום › אפשר' });
+    } else if (last) {
+      // משאירים את התוצאה האחרונה; noteText יסמן אותה כישנה
+      note.textContent = noteText();
+    } else {
+      show({ name: 'עדיין אין מיקום', q: true, note: 'ממשיך לנסות…' });
+    }
+  }
+
+  function stop() {
+    if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+    watchId = null;
+  }
+
+  // מאזין רציף: התוצאה מתעדכנת מעצמה כל עוד האפליקציה על המסך, ונעצר ברקע (חוסך סוללה)
+  function start() {
+    stop();
+    if (!navigator.geolocation) {
+      show({ name: 'אין גישה ל-GPS', q: true, note: 'המכשיר לא תומך במיקום' });
+      return;
+    }
+    if (FAKE) { onPos({ coords: { latitude: FAKE[0], longitude: FAKE[1], accuracy: 5 }, timestamp: Date.now() }); return; }
+    btn.classList.add('busy');
+    if (!last) show({ kicker: '', name: 'מחפש מיקום…', q: true, note: '' });
+    watchId = navigator.geolocation.watchPosition(onPos, onErr, { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 });
+  }
+
+  function resume() { if (!document.hidden && watchId === null) start(); }
+
+  btn.addEventListener('click', start);
+  document.addEventListener('visibilitychange', function () { document.hidden ? stop() : start(); });
+  window.addEventListener('pageshow', resume);
+  window.addEventListener('focus', resume);
+  setInterval(function () { if (last && watchId !== null) note.textContent = noteText(); }, 5000);
+  start();
 
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(function () {});
