@@ -241,7 +241,8 @@
     note.textContent = o.note || '';
   }
 
-  var watchId = null, last = null, fixes = 0;
+  var watchId = null, last = null, fixes = 0, gotWatchFix = false;
+  var RESUME_STALE_MS = 20000;   // חזרה מהרקע אחרי יותר מזה: מנקים את התוצאה הישנה
 
   // --- הערכת מיקום כשה-GPS גרוע (בתוך קרון זה קורה): ממשיכים לפי הכיוון והמהירות מהדגימה הטובה האחרונה ---
   var est = null;   // { tr, s, toward, v, t } על קטע, או { station, t } בתחנה
@@ -363,8 +364,15 @@
     }
     if (FAKE) { onPos({ coords: { latitude: FAKE[0], longitude: FAKE[1], accuracy: 5 }, timestamp: Date.now() }); return; }
     btn.classList.add('busy');
-    if (!last) show({ kicker: '', name: 'מחפש מיקום…', q: true, note: '' });
-    watchId = navigator.geolocation.watchPosition(onPos, onErr, { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 });
+    // חזרה מהרקע אחרי זמן: התוצאה והכיוון הישנים כבר לא נכונים, לא מציגים אותם כאילו הם עדכניים
+    if (last && Date.now() - last.at > RESUME_STALE_MS) { last = null; est = null; }
+    if (!last) show({ kicker: '', name: 'מאתר…', q: true, note: '' });
+    gotWatchFix = false;
+    watchId = navigator.geolocation.watchPosition(function (pos) { gotWatchFix = true; onPos(pos); }, onErr,
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 });
+    // במקביל: מיקום גס ומהיר (Wi-Fi/סלולר), עד שה-GPS ינעל. onPos כבר מסמן דיוק גרוע כניחוש
+    navigator.geolocation.getCurrentPosition(function (pos) { if (!gotWatchFix) onPos(pos); }, function () {},
+      { enableHighAccuracy: false, timeout: 10000, maximumAge: 0 });
   }
 
   function resume() { if (!document.hidden && watchId === null) start(); }
