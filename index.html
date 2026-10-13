@@ -16,7 +16,7 @@
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html,body { height:100%; margin:0; background:var(--bg); color:var(--ink);
     font-family:-apple-system,"Segoe UI",Arial,sans-serif; overscroll-behavior:none; }
-  body { display:flex; align-items:center; justify-content:center;
+  body { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px;
     padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom); }
   #btn { width:min(86vw,420px); aspect-ratio:1; border-radius:50%; border:6px solid var(--ring);
     background:radial-gradient(circle at 50% 35%, #16466f, #0e2b46); color:var(--ink);
@@ -30,6 +30,20 @@
   #name { font-size:clamp(28px,10vw,52px); font-weight:800; line-height:1.15; word-break:break-word; }
   #name.q { font-size:clamp(26px,8.5vw,44px); }
   #note { font-size:clamp(12px,3.4vw,15px); color:var(--sub); margin-top:.7em; min-height:1.2em; white-space:pre-line; line-height:1.4; }
+  #strip { width:min(86vw,420px); height:auto; pointer-events:none; overflow:visible; }
+  #strip[hidden] { display:none; }
+  #strip text { font:600 11px/1 -apple-system,"Segoe UI",Arial,sans-serif; fill:var(--ink); text-anchor:middle; }
+  #strip .dim { fill:var(--sub); font-weight:400; }
+  #strip .rail { stroke:#2c4660; stroke-width:4; stroke-linecap:round; }
+  #strip .open { stroke-dasharray:1 9; }
+  #strip .live { stroke:var(--ring); stroke-width:5; stroke-linecap:round; }
+  #strip .node { fill:var(--bg); stroke:var(--ring); stroke-width:3; }
+  #strip .node.dim { stroke:#3a5570; }
+  #strip .node.here { fill:var(--ring); }
+  #strip .arrow { fill:none; stroke:#fff; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; opacity:.8; }
+  #strip .train { fill:#ffd54a; stroke:#0b1d2e; stroke-width:2; }
+  #strip .halo { fill:#ffd54a; opacity:.25; }
+  #strip .train.approx { fill:none; stroke:#ffd54a; stroke-width:3; stroke-dasharray:3 3; }
   #credit { position:fixed; left:0; right:0; bottom:0; text-align:center; font-size:10px; color:#5d7890;
     padding:10px 8px calc(6px + env(safe-area-inset-bottom)); }
   #dbg { position:fixed; left:0; right:0; bottom:34px; margin:0; padding:10px 16px calc(10px + env(safe-area-inset-bottom));
@@ -43,6 +57,7 @@
   <div id="name" class="q">באיזו תחנה אני?</div>
   <div id="note">לחץ כדי לבדוק</div>
 </button>
+<svg id="strip" viewBox="0 0 320 96" hidden aria-hidden="true"></svg>
 <pre id="dbg" hidden></pre>
 <div id="credit">תחנות: משרד התחבורה · מסילות: © תורמי OpenStreetMap</div>
 <script src="stations.js"></script>
@@ -159,7 +174,7 @@
   // dir: { toward: אינדקס התחנה הבאה, rem: מטרים עד אליה } או null כשהכיוון לא ידוע
   function display(k, dir) {
     var a = k.a;
-    if (k.kind === 'station') return { kicker: 'תחנה', name: a.n, d: a.d };
+    if (k.kind === 'station') return { kicker: 'תחנה', name: a.n, d: a.d, view: { at: a.i } };
     if (k.kind === 'between') return { kicker: 'בדרך, בין', name: k.pair[0] + ' ל' + k.pair[1], d: a.d, between: true };
     if (k.kind === 'track') {
       var tr = k.c.tr;
@@ -169,9 +184,12 @@
           if (names.indexOf(STATIONS[x.toward][0]) < 0) names.push(STATIONS[x.toward][0]);
           rem = Math.min(rem, x.rem);
         });
-        return { kicker: 'התחנה הבאה', name: names.join(' / '), d: a.d, between: true, rem: rem };
+        var fwd = dir.toward === tr.b;
+        return { kicker: 'התחנה הבאה', name: names.join(' / '), d: a.d, between: true, rem: rem,
+                 view: { a: fwd ? tr.a : tr.b, b: dir.toward, f: fwd ? k.c.s / tr.len : 1 - k.c.s / tr.len, dir: true } };
       }
-      return { kicker: 'בדרך, בין', name: STATIONS[tr.a][0] + ' ל' + STATIONS[tr.b][0], d: a.d, between: true };
+      return { kicker: 'בדרך, בין', name: STATIONS[tr.a][0] + ' ל' + STATIONS[tr.b][0], d: a.d, between: true,
+               view: { a: tr.a, b: tr.b, f: k.c.s / tr.len } };
     }
     return { kicker: 'התחנה הקרובה ביותר', name: a.n, d: a.d, far: true };
   }
@@ -234,7 +252,70 @@
     return ' · ' + (min < 1 ? 'פחות מדקה' : 'כ-' + min + ' דק׳');
   }
 
+  // --- פס המסלול: התחנות משני צידי המיקום והרכבת עליהן (בעברית: התקדמות מימין לשמאל) ---
+  var NB = {};
+  NET.forEach(function (t) {
+    (NB[t.a] = NB[t.a] || []).push(t.b);
+    (NB[t.b] = NB[t.b] || []).push(t.a);
+  });
+  function otherEnd(i, not) {   // השכנה היחידה של תחנה i פרט ל-not, או null אם יש כמה/אין
+    var l = (NB[i] || []).filter(function (x, k, arr) { return x !== not && arr.indexOf(x) === k; });
+    return l.length === 1 ? l[0] : null;
+  }
+  var SVGNS = 'http://www.w3.org/2000/svg';
+  function svg(tag, attrs, text) {
+    var e = document.createElementNS(SVGNS, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function label(g, x, y, name, cls) {   // שם התחנה בשתי שורות לכל היותר
+    var w = name.split(' '), l1 = name, l2 = '';
+    if (name.length > 11 && w.length > 1) {
+      var best = 1, bd = 99;
+      for (var i = 1; i < w.length; i++) {
+        var d = Math.abs(w.slice(0, i).join(' ').length - w.slice(i).join(' ').length);
+        if (d < bd) { bd = d; best = i; }
+      }
+      l1 = w.slice(0, best).join(' '); l2 = w.slice(best).join(' ');
+    }
+    g.appendChild(svg('text', { x: x, y: y, 'class': cls }, l1));
+    if (l2) g.appendChild(svg('text', { x: x, y: y + 12, 'class': cls }, l2));
+  }
+  function node(g, x, i, cls, nameCls) {
+    g.appendChild(svg('circle', { cx: x, cy: 40, r: cls === 'here' ? 9 : 6, 'class': 'node ' + cls }));
+    label(g, x, 66, STATIONS[i][0], nameCls);
+  }
+  function drawStrip(v, approx) {
+    var el = document.getElementById('strip');
+    if (!v) { el.setAttribute('hidden', ''); return; }
+    el.removeAttribute('hidden');
+    while (el.firstChild) el.removeChild(el.firstChild);
+    var X = { pre: 285, a: 205, b: 115, post: 35 }, tx;
+    if (v.at !== undefined) {   // בתחנה: היא במרכז, והשכנות משני הצדדים כשהקו ברור
+      var nb = (NB[v.at] || []).filter(function (x, k, arr) { return arr.indexOf(x) === k; });
+      el.appendChild(svg('line', { x1: nb.length === 2 ? 285 : 160, y1: 40, x2: nb.length === 2 ? 35 : 160, y2: 40, 'class': 'rail' }));
+      if (nb.length === 2) { node(el, 285, nb[0], 'dim', 'dim'); node(el, 35, nb[1], 'dim', 'dim'); }
+      node(el, 160, v.at, 'here', '');
+      tx = 160;
+    } else {
+      var pre = otherEnd(v.a, v.b), post = otherEnd(v.b, v.a);
+      el.appendChild(svg('line', { x1: X.pre, y1: 40, x2: X.a, y2: 40, 'class': 'rail' + (pre === null ? ' open' : '') }));
+      el.appendChild(svg('line', { x1: X.b, y1: 40, x2: X.post, y2: 40, 'class': 'rail' + (post === null ? ' open' : '') }));
+      el.appendChild(svg('line', { x1: X.a, y1: 40, x2: X.b, y2: 40, 'class': 'live' }));
+      if (pre !== null) node(el, X.pre, pre, 'dim', 'dim');
+      if (post !== null) node(el, X.post, post, 'dim', 'dim');
+      node(el, X.a, v.a, '', '');
+      node(el, X.b, v.b, '', '');
+      if (v.dir) el.appendChild(svg('path', { d: 'M ' + (X.b + 24) + ' 33 l -8 7 l 8 7', 'class': 'arrow' }));
+      tx = X.a - Math.max(0, Math.min(1, v.f)) * (X.a - X.b);
+    }
+    if (!approx) el.appendChild(svg('circle', { cx: tx, cy: 40, r: 15, 'class': 'halo' }));
+    el.appendChild(svg('circle', { cx: tx, cy: 40, r: 8, 'class': 'train' + (approx ? ' approx' : '') }));
+  }
+
   function show(o) {
+    drawStrip(o.view, o.approx);
     kicker.textContent = o.kicker || '';
     nameEl.textContent = o.name;
     nameEl.className = o.q ? 'q' : '';
@@ -256,7 +337,7 @@
 
   function drDisplay(now, lat, lon, acc) {
     if (!est || now - est.t > DR_MAX_MS) return null;
-    if (est.station !== undefined) return { kicker: 'תחנה', name: STATIONS[est.station][0], d: 0, approx: true };
+    if (est.station !== undefined) return { kicker: 'תחנה', name: STATIONS[est.station][0], d: 0, approx: true, view: { at: est.station } };
     var tr = est.tr, sign = est.toward === tr.b ? 1 : -1;
     var s = Math.max(0, Math.min(tr.len, est.s + (est.v ? sign * est.v * (now - est.t) / 1000 : 0)));
     if (lat != null) {   // ההערכה צריכה להיות בתוך עיגול אי-הוודאות של הדגימה הגרועה, אחרת היא כנראה שגויה
@@ -264,8 +345,10 @@
       if (dist(lat, lon, p[0], p[1]) > acc + 500) { est = null; return null; }
     }
     var rem = est.toward === tr.b ? tr.len - s : s;
-    if (est.v && rem <= 50) return { kicker: 'תחנה', name: STATIONS[est.toward][0], d: 0, approx: true };
-    return { kicker: 'התחנה הבאה', name: STATIONS[est.toward][0], d: 0, between: true, approx: true, rem: est.v ? rem : null };
+    if (est.v && rem <= 50) return { kicker: 'תחנה', name: STATIONS[est.toward][0], d: 0, approx: true, view: { at: est.toward } };
+    var fwd = est.toward === tr.b;
+    return { kicker: 'התחנה הבאה', name: STATIONS[est.toward][0], d: 0, between: true, approx: true, rem: est.v ? rem : null,
+             view: { a: fwd ? tr.a : tr.b, b: est.toward, f: fwd ? s / tr.len : 1 - s / tr.len, dir: true } };
   }
 
   // ההערה מתחת לשם: מרחק/זמן לתחנה, דיוק ה-GPS ושעת העדכון; ואם המיקום לא מתעדכן, אזהרה
