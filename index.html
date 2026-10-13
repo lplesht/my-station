@@ -68,6 +68,7 @@
   var LINE_M = 700;           // בלי נתוני מסילה: מרחק מותר מהקו הישר בין שתי תחנות
   var STALE_MS = 45000;       // בלי עדכון מיקום מעבר לזה: התוצאה מסומנת כישנה
   var GOOD_ACC_M = 200;       // דגימה טובה יותר מזה מעדכנת את המיקום; גרועה יותר לא סומכים עליה
+  var STATION_EST_MS = 120000;  // כמה זמן אחרי תחנה (בלי GPS טוב) עדיין מניחים שעדיין שם
   var DR_MAX_MS = 240000;     // כמה זמן ממשיכים להעריך מיקום לפי מהירות כשה-GPS גרוע
   var DIR_MIN_M = 40;         // כמה מטרים צריך להתקדם לאורך המסילה כדי לקבוע כיוון
   var DIR_MIN_AGE_MS = 8000;  // מול דגימה ישנה לפחות כל כך
@@ -337,9 +338,17 @@
 
   function drDisplay(now, lat, lon, acc) {
     if (!est || now - est.t > DR_MAX_MS) return null;
+    if (est.station !== undefined) {
+      // רכבת לא עומדת בתחנה יותר מכמה דקות; ואם הדגימה רחוקה מהתחנה מעבר לאי-הוודאות, כבר עזבנו
+      if (now - est.t > STATION_EST_MS) return null;
+      if (lat != null && dist(lat, lon, STATIONS[est.station][1], STATIONS[est.station][2]) > acc + 500) { est = null; return null; }
+    }
     if (est.station !== undefined) return { kicker: 'תחנה', name: STATIONS[est.station][0], d: 0, approx: true, view: { at: est.station } };
     var tr = est.tr, sign = est.toward === tr.b ? 1 : -1;
-    var s = Math.max(0, Math.min(tr.len, est.s + (est.v ? sign * est.v * (now - est.t) / 1000 : 0)));
+    var raw = est.s + (est.v ? sign * est.v * (now - est.t) / 1000 : 0);
+    // עברנו את התחנה שפנינו אליה: אחרי דקה וחצי כבר לא יודעים לאן ממשיכים
+    if (est.v && (sign > 0 ? raw - tr.len : -raw) > est.v * 90) return null;
+    var s = Math.max(0, Math.min(tr.len, raw));
     if (lat != null) {   // ההערכה צריכה להיות בתוך עיגול אי-הוודאות של הדגימה הגרועה, אחרת היא כנראה שגויה
       var p = posAt(tr, s);
       if (dist(lat, lon, p[0], p[1]) > acc + 500) { est = null; return null; }
@@ -375,6 +384,15 @@
     show(last.r);
   }
 
+  // דגימה גרועה בלי הערכה: ניחוש מסומן, לא תחנה בטוחה
+  function guess(k) {
+    var r = display(k, null);
+    r.approx = true;
+    if (r.kicker === 'תחנה') r.kicker = 'באזור';
+    else if (r.kicker === 'בדרך, בין') r.kicker = 'בערך בין';
+    return r;
+  }
+
   function onPos(pos) {
     btn.classList.remove('busy');
     var now = Date.now(), acc = Math.round(pos.coords.accuracy);
@@ -383,17 +401,14 @@
     var k = null, dir = null, tag;
     if (acc > GOOD_ACC_M) {
       // GPS גרוע: לא סומכים על הנקודה. ממשיכים להעריך לפי הכיוון והמהירות, ורק בלי הערכה מציגים ניחוש מסומן
+      if (est && est.station !== undefined && gps != null && gps > 4) est = null;   // נעים: לא בתחנה
       var d = drDisplay(now, lat, lon, acc);
       if (d) {
-        last = { r: d, acc: acc, at: now, dr: true, eta: d.rem != null ? etaText({ rem: d.rem, speed: est.v }, null) : '' };
+        last = { r: d, acc: acc, at: now, dr: true, fix: [lat, lon], eta: d.rem != null ? etaText({ rem: d.rem, speed: est.v }, null) : '' };
         tag = 'poor→estimate';
       } else {
         k = classify(lat, lon, acc, curTrack, curStation);
-        var r = display(k, null);
-        r.approx = true;
-        if (r.kicker === 'תחנה') r.kicker = 'באזור';
-        else if (r.kicker === 'בדרך, בין') r.kicker = 'בערך בין';
-        last = { r: r, acc: acc, at: now, eta: '' };
+        last = { r: guess(k), acc: acc, at: now, eta: '', fix: [lat, lon] };
         tag = 'poor→guess';
       }
     } else {
@@ -469,6 +484,10 @@
     if (last.dr) {
       var d = drDisplay(Date.now(), null, null, 0);
       if (d) { last.r = d; last.eta = d.rem != null ? etaText({ rem: d.rem, speed: est.v }, null) : ''; show(Object.assign({}, d, { note: noteText() })); return; }
+      // ההערכה פגה: חוזרים לניחוש לפי הדגימה האחרונה
+      last.dr = false; est = null; last.eta = '';
+      last.r = guess(classify(last.fix[0], last.fix[1], last.acc, curTrack, curStation));
+      render(); return;
     }
     note.textContent = noteText();
   }, 2000);
